@@ -27,8 +27,8 @@ def run_detection(
             mask = np.zeros(curr_luminance.shape, dtype=bool)
         else:
             dx, dy = estimate_global_shift(prev_luminance, curr_luminance)
-            aligned_prev_luminance = compensate_shift(prev_luminance, -dx, -dy)
-            aligned_prev_rgb = compensate_shift(prev_rgb, -dx, -dy)
+            aligned_prev_luminance = compensate_shift(prev_luminance, dx, dy)
+            aligned_prev_rgb = compensate_shift(prev_rgb, dx, dy)
             mask = transition_mask(aligned_prev_luminance, curr_luminance) | red_flash_mask(aligned_prev_rgb, frame)
         scores.append(counter.update(i, mask))
         prev_rgb, prev_luminance = frame, curr_luminance
