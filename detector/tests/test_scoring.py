@@ -40,3 +40,11 @@ def test_flicker_score_fields():
     assert score.frame_index == 3
     assert score.flash_count_last_second == 2
     assert score.flagged_area_ratio == 0.15
+
+
+def test_windowed_counter_counts_sustained_strobe_correctly():
+    counter = WindowedFlashCounter(fps=10)  # window = 10 frames
+    full_mask = np.ones((2, 2), dtype=bool)
+    scores = [counter.update(i, full_mask) for i in range(15)]  # sustained past the window
+    # every frame in the trailing window is flagged -> should report the full window size, not 1
+    assert scores[-1].flash_count_last_second == 10
