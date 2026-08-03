@@ -281,6 +281,54 @@ def test_run_batch_realistic_mode_calls_synthesize_sample_realistic(tmp_path, mo
     assert summary["failed"] == 2  # the fake always returns None -> validation_exhausted
 
 
+def test_run_batch_raises_when_resuming_into_a_directory_with_a_different_injection_mode(tmp_path):
+    clips_dir, profiles_dir = _standard_inputs(tmp_path)
+    out_dir = tmp_path / "out"
+
+    run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1, seed=0, injection_mode="flat")
+
+    with pytest.raises(ValueError, match="injection_mode"):
+        run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1, seed=0, injection_mode="realistic")
+
+
+def test_run_batch_resumes_normally_when_injection_mode_matches(tmp_path):
+    clips_dir, profiles_dir = _standard_inputs(tmp_path)
+    out_dir = tmp_path / "out"
+
+    run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1, seed=0, injection_mode="flat")
+    second = run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1, seed=1, injection_mode="flat")
+
+    assert second["accepted"] == 0
+    assert second["skipped_existing"] == 2
+
+
+def test_run_batch_overwrite_bypasses_injection_mode_mismatch_check(tmp_path):
+    clips_dir, profiles_dir = _standard_inputs(tmp_path)
+    out_dir = tmp_path / "out"
+
+    run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1, seed=0, injection_mode="flat")
+    # overwrite=True regenerates unconditionally, so a mode switch must not raise.
+    second = run_batch(
+        clips_dir, profiles_dir, out_dir, samples_per_combo=1, seed=0,
+        injection_mode="realistic", overwrite=True,
+    )
+
+    assert second["skipped_existing"] == 0
+    assert second["accepted"] == 2
+    meta = json.loads((out_dir / "bear__tiny__general__000" / "meta.json").read_text(encoding="utf-8"))
+    assert meta["injection_mode"] == "realistic"
+
+
+def test_write_sample_records_injection_mode_via_run_batch(tmp_path):
+    clips_dir, profiles_dir = _standard_inputs(tmp_path)
+    out_dir = tmp_path / "out"
+
+    run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1, seed=0, injection_mode="flat")
+
+    meta = json.loads((out_dir / "bear__tiny__general__000" / "meta.json").read_text(encoding="utf-8"))
+    assert meta["injection_mode"] == "flat"
+
+
 def test_run_batch_defaults_to_flat_injection_mode(tmp_path, monkeypatch):
     import training.cli as cli_module
 

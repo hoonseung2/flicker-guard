@@ -32,7 +32,12 @@ import numpy as np
 
 from detector.cli import VideoReadError, read_video_frames
 from detector.profiles import load_profile
-from training.dataset_writer import sample_exists, sample_id, write_sample
+from training.dataset_writer import (
+    sample_exists,
+    sample_id,
+    sample_injection_mode,
+    write_sample,
+)
 from training.params import ClipTooShortError
 from training.synth import synthesize_sample, synthesize_sample_realistic
 
@@ -151,6 +156,15 @@ def run_batch(
                 for index in range(samples_per_combo):
                     sid = sample_id(clip_id, profile.name, pattern, index)
                     if not overwrite and sample_exists(out_root, sid):
+                        existing_mode = sample_injection_mode(out_root, sid)
+                        if existing_mode != injection_mode:
+                            raise ValueError(
+                                f"sample {sid!r} already exists under --output with "
+                                f"injection_mode={existing_mode!r}, but this run "
+                                f"requested injection_mode={injection_mode!r}. Pass "
+                                f"--overwrite to regenerate it, or point --output at "
+                                f"an empty directory."
+                            )
                         summary["skipped_existing"] += 1
                         combo["skipped_existing"] += 1
                         continue
@@ -170,7 +184,7 @@ def run_batch(
                             profile.name, pattern, index,
                         )
                         continue
-                    write_sample(sample, out_root, clip_id, index)
+                    write_sample(sample, out_root, clip_id, index, injection_mode=injection_mode)
                     summary["accepted"] += 1
                     combo["accepted"] += 1
 
