@@ -42,7 +42,16 @@
 - **프레임당 비용**: 합성+저장 약 0.156초/프레임(패턴당), 스크리닝(탐지만) 약 0.072초/프레임
 - **90개 전체 확장 시 추정**: 스크리닝 ~7.5분 + 합성 ~26분(통과율 80% 가정 시) ≈ **총 30~35분**, 용량 **약 10~16GB** (통과율에 따라 변동)
 
-## 6. 다음 단계
+## 6. DAVIS 90개 전체 실행 결과 (완료)
 
-- [ ] DAVIS 90개 전체: 스크리닝(itu 기준) → 변환 → 배치 실행
+- **변환**: 90개 전체 → `data/clips_all/` (228MB)
+- **스크리닝** (itu 기준): **61 clean / 29 flagged** (67.8%) — flagged 목록은 `scripts/screen_clean_clips.py --clips-dir data/clips_all --profiles-dir data/profiles_active`로 재현 가능
+- **배치 합성** (itu, general+red, 61클립 × 2패턴 = 122조합): **116 성공 / 6 실패**, 재시도 소진은 0건
+  - 실패 6건 전부 "clip_too_short" — `dog-agility`(25프레임), `judo`(34프레임), `rollerblade`(35프레임)이 itu 최소 요구치(37프레임 @ 24fps)에 못 미침. 크래시 없이 정확한 사유로 기록됨.
+- **최종 산출물**: `data/synthetic/` — 116개 샘플 폴더, **8.9GB**
+- 사전 추정(10~16GB)보다 실제로는 낮게 나옴 — 통과율(67.8%)이 초기 5클립 표본(80%)보다 낮았지만, 짧은 클립 6개가 조기 실패해서 상쇄됨.
+
+## 7. 다음 단계
+
+- [x] DAVIS 90개 전체: 스크리닝(itu 기준) → 변환 → 배치 실행
 - [ ] Mitigator 학습 설계 — 단, README 아키텍처상 `Detector → PriorCalc → Mitigator`인데 **PriorCalc가 아직 없음**. Mitigator 설계 전에 PriorCalc부터 다룰지 결정 필요.
