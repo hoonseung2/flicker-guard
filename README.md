@@ -140,6 +140,7 @@ flicker-guard/
 - **PSE 특화 학습 데이터 부재**: 기존 공개 데이터셋(Deflicker의 Blind-Video-Deflickering-Dataset, Flickerformer의 BurstDeflicker) 모두 목적이 달라 그대로 못 씀 — DatasetSynth를 직접 구현해야 함.
 - **외부 검증 필수**: 이 시스템은 의료기기·임상 진단 도구가 아니며, 자체 Detector가 학습 라벨링과 런타임 판정을 모두 담당하는 구조라 순환 검증 위험이 있음. **실제 서비스 배포 전 Harding FPA 등 검증된 외부 도구·전문가 검토가 반드시 필요**.
 - **근거 수준 구분**: PSE는 법적 강제 표준이 있는 영역이나, 이 필터가 모든 경우에 발작을 예방한다고 단정할 수 없음 — 안전을 보장하는 표현은 사용하지 않는다.
+- **WCAG 면적 기준의 "10도 시야각 서브셋" 미반영**: Jordan, "Evaluating Conformance of Video Safety Tools for Photosensitive Epilepsy" (Universal Access in HCI 학회 논문)에 따르면 WCAG의 면적 기준은 "화면 전체의 25%"가 아니라 "10도 시야각 서브셋 안에서의 25%"이며, 컴퓨터 화면 기준 약 416×416px(CSS 기준 픽셀)가 10도 시야각과 유사한 면적으로 제시됨. 현재 Detector의 `flagged_area_ratio`는 화면 전체 대비 비율로만 계산해서, 화면에 흩어진 여러 작은 위험 영역의 합이 25%를 넘어도 각각이 10도 서브셋 밖에 있으면 실제 WCAG 기준으로는 다르게 판정될 수 있음. Ofcom 어두운 장면 규칙·일본 패턴 밀도 규칙과 같은 급의 미반영 gap — PriorCalc/Mitigator 구현 착수 전에 반영 여부 확인 필요.
 
 ## 10. 다음 단계
 
