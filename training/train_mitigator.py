@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, default_collate
 
 from detector.profiles import load_profile
 from mitigator.arch import MitigatorNet, mitigate_frame
@@ -86,6 +86,56 @@ def evaluate(model: MitigatorNet, dataloader: DataLoader, device: str) -> dict:
     return {"loss": total_loss / n_batches, "psnr": total_psnr / n_batches}
 
 
+def _make_patch_collate_fn(patch_size: int):
+    """Creates a collate function that randomly crops all spatial tensors to patch_size.
+
+    Crops window, mask, and clean with the same random offset to keep them aligned.
+    Leaves histogram (non-spatial) untouched. Clamps crop size to actual H/W if smaller.
+    """
+    def collate_fn(batch):
+        # First, use default collate to stack tensors
+        batch = default_collate(batch)
+
+        # Extract spatial tensors (batch_size, C, H, W)
+        window = batch["window"]  # (B, 9, H, W)
+        mask = batch["mask"]      # (B, 1, H, W)
+        clean = batch["clean"]    # (B, 3, H, W)
+        histogram = batch["histogram"]  # (B, 64) - non-spatial, don't crop
+
+        batch_size, _, h, w = window.shape
+
+        # Clamp patch_size to actual dimensions
+        crop_h = min(patch_size, h)
+        crop_w = min(patch_size, w)
+
+        # For each example in the batch, apply same random crop to all three spatial tensors
+        cropped_windows = []
+        cropped_masks = []
+        cropped_cleans = []
+
+        for i in range(batch_size):
+            # Pick one random offset per example
+            max_top = max(0, h - crop_h)
+            max_left = max(0, w - crop_w)
+            top = torch.randint(0, max_top + 1, (1,)).item() if max_top > 0 else 0
+            left = torch.randint(0, max_left + 1, (1,)).item() if max_left > 0 else 0
+
+            # Apply same crop to window, mask, and clean
+            cropped_windows.append(window[i, :, top:top+crop_h, left:left+crop_w])
+            cropped_masks.append(mask[i, :, top:top+crop_h, left:left+crop_w])
+            cropped_cleans.append(clean[i, :, top:top+crop_h, left:left+crop_w])
+
+        # Stack back into batches
+        batch["window"] = torch.stack(cropped_windows)
+        batch["mask"] = torch.stack(cropped_masks)
+        batch["clean"] = torch.stack(cropped_cleans)
+        batch["histogram"] = histogram  # unchanged
+
+        return batch
+
+    return collate_fn
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Train Mitigator on DatasetSynth output.")
     parser.add_argument("--data-dir", required=True)
@@ -96,6 +146,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--log-path")
+    parser.add_argument("--patch-size", type=int, default=None,
+                        help="Optional: random crop to this spatial size (e.g. 256) for VRAM-limited training on local GPUs. "
+                             "Omit for full-resolution training on high-VRAM hardware (default: None, no crop).")
     args = parser.parse_args(argv)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -106,8 +159,14 @@ def main(argv: list[str] | None = None) -> int:
 
     train_dataset = MitigatorDataset(Path(args.data_dir), profile, split="train")
     val_dataset = MitigatorDataset(Path(args.data_dir), profile, split="val")
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+
+    # Create collate function if patch_size is specified
+    collate_fn = None
+    if args.patch_size is not None:
+        collate_fn = _make_patch_collate_fn(args.patch_size)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
 
     model = MitigatorNet()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
