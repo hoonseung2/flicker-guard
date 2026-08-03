@@ -22,10 +22,11 @@ Per README section 9, Harding FPA or equivalent external validation is still
 required before production use. Nothing here may be presented as a guarantee
 that content is safe.
 
-Streaming (final-review finding I6): `frames` is any iterable — the pipeline
+Streaming (final-review finding I6): `frames` is any iterable — `run_detection`
 is strictly causal and never holds more than the previous and current frame,
 so a generator from `detector.cli.read_video_frames` streams a video without
-materialising it in RAM.
+materialising it in RAM. This guarantee covers `run_detection` only; see the
+per-pixel masks paragraph below for `run_detection_with_masks`.
 
 Uncertain edges (final-review finding I4, README section 7): frame 0 has no
 predecessor, so its transition is unknown rather than safe. It is fed to the
@@ -38,7 +39,11 @@ mask for every frame internally and discards it, keeping only the aggregate
 same internal per-frame loop (`_iter_scores_and_masks`), but also returns
 those masks -- PriorCalc needs to know *where* in the frame a transition
 happened, not just whether the frame is risky. `run_detection`'s own
-signature and behavior are unchanged by this addition.
+signature and behavior are unchanged by this addition. Note that
+`run_detection_with_masks` does **not** inherit the streaming property above:
+it retains one `(H, W)` bool mask per frame, so its peak memory is O(N·H·W)
+mask bytes (~2 MB/frame at 1080p, i.e. several GB for a long clip). Use it on
+bounded clips only; for long or streaming input use `run_detection`.
 """
 from collections.abc import Iterable, Iterator
 
