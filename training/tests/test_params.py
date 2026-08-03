@@ -1,0 +1,84 @@
+import pathlib
+
+import numpy as np
+import pytest
+
+from detector.profiles import ThresholdProfile, load_profile
+from training.params import sample_synthesis_params
+
+PROFILE = ThresholdProfile(
+    name="test", max_flashes_per_second=3, max_area_ratio=0.10,
+    general_flash_dark_threshold=0.80, general_flash_delta_threshold=0.10,
+    red_saturation_ratio_threshold=0.80,
+)
+
+SHIPPED_PROFILES_DIR = pathlib.Path(__file__).parent.parent.parent / "configs" / "profiles"
+
+
+def test_sample_synthesis_params_general_flash_targets_exceed_profile_thresholds():
+    rng = np.random.default_rng(0)
+    params = sample_synthesis_params(PROFILE, "general", clip_frame_count=90, frame_height=100, frame_width=100, fps=30.0, rng=rng)
+    assert params.pattern == "general"
+    assert params.dark_target < PROFILE.general_flash_dark_threshold
+    assert params.bright_target - params.dark_target > PROFILE.general_flash_delta_threshold
+    assert params.bright_target <= 1.0
+
+
+def test_sample_synthesis_params_red_flash_targets_exceed_ratio_threshold():
+    rng = np.random.default_rng(0)
+    params = sample_synthesis_params(PROFILE, "red", clip_frame_count=90, frame_height=100, frame_width=100, fps=30.0, rng=rng)
+    assert params.pattern == "red"
+    r, g, b = params.red_rgb
+    assert r / (r + g + b) > PROFILE.red_saturation_ratio_threshold
+    br, bg, bb = params.baseline_rgb
+    assert br / (br + bg + bb) < PROFILE.red_saturation_ratio_threshold
+
+
+def test_sample_synthesis_params_mask_area_exceeds_profile_ratio():
+    rng = np.random.default_rng(0)
+    params = sample_synthesis_params(PROFILE, "general", clip_frame_count=90, frame_height=100, frame_width=100, fps=30.0, rng=rng)
+    w = params.window
+    mask_area_ratio = (w.mask_height * w.mask_width) / (100 * 100)
+    assert mask_area_ratio > PROFILE.max_area_ratio
+    assert 0 <= w.mask_top and w.mask_top + w.mask_height <= 100
+    assert 0 <= w.mask_left and w.mask_left + w.mask_width <= 100
+
+
+def test_sample_synthesis_params_period_yields_enough_flagged_frames_per_window():
+    rng = np.random.default_rng(0)
+    fps = 30.0
+    params = sample_synthesis_params(PROFILE, "general", clip_frame_count=90, frame_height=100, frame_width=100, fps=fps, rng=rng)
+    window_frames = round(fps)
+    flagged_per_window = window_frames // params.window.period_frames
+    assert flagged_per_window > PROFILE.max_flashes_per_second
+
+
+def test_sample_synthesis_params_window_fits_inside_clip_and_covers_full_second():
+    rng = np.random.default_rng(0)
+    fps = 30.0
+    clip_frame_count = 90
+    params = sample_synthesis_params(PROFILE, "general", clip_frame_count=clip_frame_count, frame_height=100, frame_width=100, fps=fps, rng=rng)
+    w = params.window
+    assert 1 <= w.start_frame
+    assert w.end_frame < clip_frame_count
+    assert (w.end_frame - w.start_frame + 1) >= round(fps)
+    assert w.ramp_frames == round(fps)
+    assert (w.end_frame - w.start_frame + 1) - w.ramp_frames >= 2 * w.period_frames
+
+
+def test_sample_synthesis_params_raises_when_clip_too_short():
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError):
+        sample_synthesis_params(PROFILE, "general", clip_frame_count=5, frame_height=100, frame_width=100, fps=30.0, rng=rng)
+
+
+@pytest.mark.parametrize("filename", ["kr.json", "jp.json", "itu.json", "ofcom.json", "w3c.json", "netflix.json"])
+def test_sample_synthesis_params_exceeds_each_shipped_profile(filename):
+    profile = load_profile(SHIPPED_PROFILES_DIR / filename)
+    rng = np.random.default_rng(0)
+    params = sample_synthesis_params(profile, "general", clip_frame_count=90, frame_height=100, frame_width=100, fps=30.0, rng=rng)
+    mask_area_ratio = (params.window.mask_height * params.window.mask_width) / (100 * 100)
+    assert mask_area_ratio > profile.max_area_ratio
+    window_frames = round(30.0)
+    flagged_per_window = window_frames // params.window.period_frames
+    assert flagged_per_window > profile.max_flashes_per_second
