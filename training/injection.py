@@ -7,6 +7,13 @@ profile).
 Frames outside the injection window, and pixels outside the mask, are left
 byte-identical to the input -- this is what makes the input clip usable
 directly as Mitigator's clean ground truth outside the injected region.
+
+Alongside the flat-color-overwrite functions above, this module also
+provides `inject_general_flash_realistic`/`inject_red_flash_realistic`:
+instead of replacing pixels with a fixed color, they multiply the original
+scene's linear-light values by a fixed gain per alternating state, which
+preserves scene texture while still producing a Detector-flaggable
+transition.
 """
 import numpy as np
 

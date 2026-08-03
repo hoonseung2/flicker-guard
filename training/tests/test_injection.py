@@ -159,9 +159,6 @@ def test_inject_general_flash_realistic_preserves_texture():
 
 
 def test_inject_general_flash_realistic_transitions_are_flagged_by_detector():
-    from detector.flash import transition_mask
-    from detector.luminance import relative_luminance
-
     rng = np.random.default_rng(0)
     frame = rng.uniform(0.1, 0.9, size=(20, 20, 3)).astype(np.float32)
     frames = [frame.copy() for _ in range(8)]
@@ -174,8 +171,6 @@ def test_inject_general_flash_realistic_transitions_are_flagged_by_detector():
 
 
 def test_inject_red_flash_realistic_transitions_are_flagged_by_detector():
-    from detector.flash import red_flash_mask
-
     rng = np.random.default_rng(0)
     frame = rng.uniform(0.1, 0.9, size=(10, 10, 3)).astype(np.float32)
     frames = [frame.copy() for _ in range(6)]

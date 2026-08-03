@@ -1,8 +1,7 @@
 import numpy as np
 
 from detector.profiles import ThresholdProfile
-from training.synth import synthesize_sample
-from training.synth import synthesize_sample_realistic
+from training.synth import synthesize_sample, synthesize_sample_realistic
 
 PROFILE = ThresholdProfile(
     name="test", max_flashes_per_second=3, max_area_ratio=0.10,
