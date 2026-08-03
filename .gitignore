@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Raw and generated datasets — large binary content, never committed.
+data/
