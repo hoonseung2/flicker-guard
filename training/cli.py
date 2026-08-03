@@ -184,7 +184,7 @@ def run_batch(
                             profile.name, pattern, index,
                         )
                         continue
-                    write_sample(sample, out_root, clip_id, index, injection_mode=injection_mode)
+                    write_sample(sample, out_root, clip_id, index, injection_mode=injection_mode, fps=fps)
                     summary["accepted"] += 1
                     combo["accepted"] += 1
 

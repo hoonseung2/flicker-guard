@@ -33,7 +33,7 @@ def test_sample_id_format():
 
 
 def test_write_sample_creates_frame_files_and_metadata(tmp_path):
-    sid = write_sample(_sample(), tmp_path, clip_id="bear", index=0, injection_mode="flat")
+    sid = write_sample(_sample(), tmp_path, clip_id="bear", index=0, injection_mode="flat", fps=24.0)
     sample_dir = tmp_path / sid
     assert (sample_dir / "clean" / "000000.png").exists()
     assert (sample_dir / "clean" / "000011.png").exists()
@@ -48,20 +48,26 @@ def test_write_sample_creates_frame_files_and_metadata(tmp_path):
 
 
 def test_write_sample_records_realistic_injection_mode(tmp_path):
-    sid = write_sample(_sample(), tmp_path, clip_id="bear", index=0, injection_mode="realistic")
+    sid = write_sample(_sample(), tmp_path, clip_id="bear", index=0, injection_mode="realistic", fps=24.0)
     meta = json.loads((tmp_path / sid / "meta.json").read_text(encoding="utf-8"))
     assert meta["injection_mode"] == "realistic"
+
+
+def test_write_sample_records_fps(tmp_path):
+    sid = write_sample(_sample(), tmp_path, clip_id="bear", index=0, injection_mode="flat", fps=24.0)
+    meta = json.loads((tmp_path / sid / "meta.json").read_text(encoding="utf-8"))
+    assert meta["fps"] == 24.0
 
 
 def test_sample_exists_true_after_write_false_before(tmp_path):
     sid = sample_id("bear", "kr", "general", 0)
     assert not sample_exists(tmp_path, sid)
-    write_sample(_sample(), tmp_path, clip_id="bear", index=0, injection_mode="flat")
+    write_sample(_sample(), tmp_path, clip_id="bear", index=0, injection_mode="flat", fps=24.0)
     assert sample_exists(tmp_path, sid)
 
 
 def test_sample_injection_mode_reads_back_recorded_mode(tmp_path):
-    sid = write_sample(_sample(), tmp_path, clip_id="bear", index=0, injection_mode="realistic")
+    sid = write_sample(_sample(), tmp_path, clip_id="bear", index=0, injection_mode="realistic", fps=24.0)
     assert sample_injection_mode(tmp_path, sid) == "realistic"
 
 
@@ -83,7 +89,7 @@ def test_write_sample_raises_and_writes_no_meta_when_a_frame_write_fails(tmp_pat
     monkeypatch.setattr(dataset_writer.cv2, "imwrite", lambda *args, **kwargs: False)
 
     with pytest.raises(OSError):
-        write_sample(_sample(), tmp_path, clip_id="bear", index=0, injection_mode="flat")
+        write_sample(_sample(), tmp_path, clip_id="bear", index=0, injection_mode="flat", fps=24.0)
 
     sid = sample_id("bear", "kr", "general", 0)
     assert not (tmp_path / sid / "meta.json").exists()

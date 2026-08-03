@@ -66,6 +66,7 @@ def write_sample(
     clip_id: str,
     index: int,
     injection_mode: str,
+    fps: float,
 ) -> str:
     sid = sample_id(clip_id, sample.profile_name, sample.pattern, index)
     sample_dir = Path(out_root) / sid
@@ -78,6 +79,7 @@ def write_sample(
         "profile": sample.profile_name,
         "pattern": sample.pattern,
         "injection_mode": injection_mode,
+        "fps": fps,
         "injected_window": dataclasses.asdict(sample.window),
         "segments": [dataclasses.asdict(s) for s in sample.segments],
     }
