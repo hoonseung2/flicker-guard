@@ -19,6 +19,10 @@ class SynthesizedSample:
     pattern: str
     profile_name: str
     window: InjectionWindow
+    # Intentionally an alias of the caller's frame list/arrays, never a copy:
+    # the batch loop reuses one clip across 12 profile x pattern combos, so
+    # copying here would multiply peak memory for no benefit. Nothing in the
+    # pipeline mutates it (injection.py copies before writing). Never mutate.
     clean_frames: list[np.ndarray]
     degraded_frames: list[np.ndarray]
     segments: list[RiskSegment]
@@ -59,7 +63,7 @@ def synthesize_sample(
                 pattern=pattern,
                 profile_name=profile.name,
                 window=params.window,
-                clean_frames=clean_frames,
+                clean_frames=clean_frames,  # intentional alias, not a copy — see dataclass field
                 degraded_frames=degraded_frames,
                 segments=segments,
             )

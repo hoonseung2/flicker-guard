@@ -12,6 +12,13 @@ trailing one-second window), not the visual flash rate (see
 detector/scoring.py). `period_frames` here is chosen so the number of
 flagged frames inside any trailing one-second window exceeds
 `max_flashes_per_second` with margin.
+
+Every target here is clamped (`_MAX_AREA_RATIO`, `_MAX_SATURATION_TARGET`,
+`bright_target <= 1.0`), so a profile sitting close enough to one of those
+caps could silently receive a target that does not actually exceed its own
+threshold — whose only symptom would be every synthesis attempt exhausting
+its retries with no diagnostic. `_require_exceeds` turns that into an
+immediate, legible configuration error instead.
 """
 from dataclasses import dataclass
 
@@ -23,6 +30,15 @@ _AREA_MARGIN = 0.10
 _MAX_AREA_RATIO = 0.90
 _RATIO_MARGIN = 0.05
 _MAX_SATURATION_TARGET = 0.99
+
+
+class ClipTooShortError(ValueError):
+    """The clip has fewer frames than one injection window needs.
+
+    A distinct type (rather than a bare ValueError) so callers can tell "this
+    particular clip is unusable, skip it and carry on" apart from "this
+    profile can never be satisfied", which is a fail-fast config error.
+    """
 
 
 @dataclass
@@ -45,6 +61,31 @@ class SynthParams:
     bright_target: float | None = None
     red_rgb: tuple[float, float, float] | None = None
     baseline_rgb: tuple[float, float, float] | None = None
+
+
+def _require_exceeds(
+    achieved: float,
+    threshold: float,
+    profile_name: str,
+    threshold_field: str,
+    quantity: str,
+    cap_reason: str,
+) -> None:
+    """Fail loudly when a clamp/rounding cap has eaten the safety margin.
+
+    Every target here is capped (`_MAX_AREA_RATIO`, `_MAX_SATURATION_TARGET`,
+    `bright_target <= 1.0`). A profile close enough to a cap silently stops
+    getting a target that actually exceeds its own threshold, and the only
+    symptom would be every synthesis attempt exhausting its retries with no
+    diagnostic. Turn that into an immediate configuration error instead.
+    """
+    if achieved > threshold:
+        return
+    raise ValueError(
+        f"profile {profile_name!r}: {quantity} {achieved:.4f} does not exceed "
+        f"{threshold_field}={threshold:.4f} — {cap_reason}. This profile "
+        f"cannot be synthesized against; widen the cap or relax the profile."
+    )
 
 
 def _mask_dims(frame_height: int, frame_width: int, target_area_ratio: float) -> tuple[int, int, int, int]:
@@ -85,7 +126,7 @@ def sample_synthesis_params(
     duration_frames = window_frames + 4 * period_frames
 
     if clip_frame_count < duration_frames + 1:
-        raise ValueError(
+        raise ClipTooShortError(
             f"clip has {clip_frame_count} frames, need at least "
             f"{duration_frames + 1} for fps={fps} and profile {profile.name!r}"
         )
@@ -96,6 +137,14 @@ def sample_synthesis_params(
 
     mask_top, mask_left, mask_height, mask_width = _mask_dims(
         frame_height, frame_width, profile.max_area_ratio + _AREA_MARGIN
+    )
+    achieved_area_ratio = (mask_height * mask_width) / (frame_height * frame_width)
+    _require_exceeds(
+        achieved_area_ratio, profile.max_area_ratio, profile.name,
+        "max_area_ratio", "injected mask area ratio",
+        f"the mask is capped at {_MAX_AREA_RATIO:.2f} of the frame "
+        f"(_MAX_AREA_RATIO) and rounded to whole pixels on "
+        f"{frame_height}x{frame_width}",
     )
 
     window = InjectionWindow(
@@ -112,9 +161,19 @@ def sample_synthesis_params(
     if pattern == "general":
         dark_target = profile.general_flash_dark_threshold * 0.5
         bright_target = min(1.0, dark_target + profile.general_flash_delta_threshold + 0.1)
+        _require_exceeds(
+            bright_target - dark_target, profile.general_flash_delta_threshold, profile.name,
+            "general_flash_delta_threshold", "injected luminance delta",
+            "bright_target is clamped to 1.0",
+        )
         return SynthParams(pattern="general", window=window, dark_target=dark_target, bright_target=bright_target)
 
     target_ratio = min(_MAX_SATURATION_TARGET, profile.red_saturation_ratio_threshold + _RATIO_MARGIN)
+    _require_exceeds(
+        target_ratio, profile.red_saturation_ratio_threshold, profile.name,
+        "red_saturation_ratio_threshold", "injected red saturation ratio",
+        f"the target is capped at {_MAX_SATURATION_TARGET} (_MAX_SATURATION_TARGET)",
+    )
     r = 0.9
     gb_sum = r / target_ratio - r
     red_rgb = (r, gb_sum / 2, gb_sum / 2)

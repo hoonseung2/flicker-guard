@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from detector.profiles import ThresholdProfile, load_profile
-from training.params import sample_synthesis_params
+from training.params import ClipTooShortError, sample_synthesis_params
 
 PROFILE = ThresholdProfile(
     name="test", max_flashes_per_second=3, max_area_ratio=0.10,
@@ -70,6 +70,53 @@ def test_sample_synthesis_params_raises_when_clip_too_short():
     rng = np.random.default_rng(0)
     with pytest.raises(ValueError):
         sample_synthesis_params(PROFILE, "general", clip_frame_count=5, frame_height=100, frame_width=100, fps=30.0, rng=rng)
+
+
+def test_clip_too_short_raises_the_specific_exception_type():
+    # The CLI distinguishes "this clip is too short" from every other
+    # ValueError (e.g. an unusable profile), so it needs its own type.
+    rng = np.random.default_rng(0)
+    with pytest.raises(ClipTooShortError):
+        sample_synthesis_params(PROFILE, "general", clip_frame_count=5, frame_height=100, frame_width=100, fps=30.0, rng=rng)
+    assert issubclass(ClipTooShortError, ValueError)
+
+
+def test_sample_synthesis_params_rejects_profile_whose_area_target_is_unreachable():
+    # _MAX_AREA_RATIO caps the mask at 90% of the frame, so a profile whose
+    # own max_area_ratio is at/above that can never get an exceeding mask.
+    # This must be a legible config error, not silent retry exhaustion.
+    profile = ThresholdProfile(
+        name="area-cliff", max_flashes_per_second=3, max_area_ratio=0.95,
+        general_flash_dark_threshold=0.80, general_flash_delta_threshold=0.10,
+        red_saturation_ratio_threshold=0.80,
+    )
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="area-cliff"):
+        sample_synthesis_params(profile, "general", clip_frame_count=90, frame_height=100, frame_width=100, fps=30.0, rng=rng)
+
+
+def test_sample_synthesis_params_rejects_profile_whose_saturation_target_is_unreachable():
+    profile = ThresholdProfile(
+        name="sat-cliff", max_flashes_per_second=3, max_area_ratio=0.10,
+        general_flash_dark_threshold=0.80, general_flash_delta_threshold=0.10,
+        red_saturation_ratio_threshold=0.99,
+    )
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="sat-cliff"):
+        sample_synthesis_params(profile, "red", clip_frame_count=90, frame_height=100, frame_width=100, fps=30.0, rng=rng)
+
+
+def test_sample_synthesis_params_rejects_profile_whose_delta_target_is_unreachable():
+    # bright_target is clamped at 1.0, so a large delta threshold combined
+    # with a high dark threshold leaves no room for the required delta.
+    profile = ThresholdProfile(
+        name="delta-cliff", max_flashes_per_second=3, max_area_ratio=0.10,
+        general_flash_dark_threshold=1.00, general_flash_delta_threshold=0.60,
+        red_saturation_ratio_threshold=0.80,
+    )
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="delta-cliff"):
+        sample_synthesis_params(profile, "general", clip_frame_count=90, frame_height=100, frame_width=100, fps=30.0, rng=rng)
 
 
 @pytest.mark.parametrize("filename", ["kr.json", "jp.json", "itu.json", "ofcom.json", "w3c.json", "netflix.json"])
