@@ -253,3 +253,52 @@ def test_run_batch_summary_reports_per_profile_pattern_breakdown(tmp_path):
     assert second["by_profile_pattern"]["tiny/general"] == {
         "accepted": 0, "skipped_existing": 1, "failed": 0,
     }
+
+
+def test_run_batch_realistic_mode_calls_synthesize_sample_realistic(tmp_path, monkeypatch):
+    import training.cli as cli_module
+
+    calls = []
+
+    def _fake_realistic(*args, **kwargs):
+        calls.append(1)
+        return None
+
+    monkeypatch.setattr(cli_module, "synthesize_sample_realistic", _fake_realistic)
+
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    _write_clip(clips_dir / "bear.mp4")
+    profiles_dir = tmp_path / "profiles"
+    _write_profiles_dir(profiles_dir)
+    out_dir = tmp_path / "out"
+
+    summary = cli_module.run_batch(
+        clips_dir, profiles_dir, out_dir, samples_per_combo=1, injection_mode="realistic"
+    )
+
+    assert len(calls) == 2  # one call per pattern (general, red)
+    assert summary["failed"] == 2  # the fake always returns None -> validation_exhausted
+
+
+def test_run_batch_defaults_to_flat_injection_mode(tmp_path, monkeypatch):
+    import training.cli as cli_module
+
+    calls = []
+
+    def _fake_flat(*args, **kwargs):
+        calls.append(1)
+        return None
+
+    monkeypatch.setattr(cli_module, "synthesize_sample", _fake_flat)
+
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    _write_clip(clips_dir / "bear.mp4")
+    profiles_dir = tmp_path / "profiles"
+    _write_profiles_dir(profiles_dir)
+    out_dir = tmp_path / "out"
+
+    cli_module.run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1)  # no injection_mode passed
+
+    assert len(calls) == 2

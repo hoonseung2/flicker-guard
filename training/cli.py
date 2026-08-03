@@ -34,7 +34,7 @@ from detector.cli import VideoReadError, read_video_frames
 from detector.profiles import load_profile
 from training.dataset_writer import sample_exists, sample_id, write_sample
 from training.params import ClipTooShortError
-from training.synth import synthesize_sample
+from training.synth import synthesize_sample, synthesize_sample_realistic
 
 PATTERNS = ("general", "red")
 
@@ -115,7 +115,15 @@ def run_batch(
     samples_per_combo: int,
     seed: int = 0,
     overwrite: bool = False,
+    injection_mode: str = "flat",
 ) -> dict:
+    if injection_mode == "flat":
+        synthesize = synthesize_sample
+    elif injection_mode == "realistic":
+        synthesize = synthesize_sample_realistic
+    else:
+        raise ValueError(f"unknown injection_mode: {injection_mode!r}")
+
     profiles = _load_profiles(profiles_dir)
 
     clips_dir = Path(clips_dir)
@@ -147,7 +155,7 @@ def run_batch(
                         combo["skipped_existing"] += 1
                         continue
                     try:
-                        sample = synthesize_sample(
+                        sample = synthesize(
                             clean_frames, fps, profile, pattern, _sample_rng(seed, sid)
                         )
                     except ClipTooShortError as exc:
@@ -182,6 +190,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="regenerate samples that already exist under --output instead of skipping them",
     )
+    parser.add_argument(
+        "--injection-mode",
+        choices=["flat", "realistic"],
+        default="flat",
+        help=(
+            "flat: overwrite pixels with a fixed color (original DatasetSynth "
+            "behavior). realistic: multiply original luminance/color by a fixed "
+            "gain in linear light space, preserving scene texture."
+        ),
+    )
     args = parser.parse_args(argv)
 
     out_root = Path(args.output)
@@ -194,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         samples_per_combo=args.samples_per_combo,
         seed=args.seed,
         overwrite=args.overwrite,
+        injection_mode=args.injection_mode,
     )
 
     summary_path = Path(args.summary_output) if args.summary_output else out_root / "summary.json"
