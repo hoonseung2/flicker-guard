@@ -34,6 +34,18 @@ def sample_exists(out_root: Path, sid: str) -> bool:
     return (Path(out_root) / sid / "meta.json").exists()
 
 
+def sample_injection_mode(out_root: Path, sid: str) -> str:
+    """The injection_mode recorded in an existing sample's meta.json.
+
+    Defaults to "flat" when the field is absent, since every sample written
+    before this field was added came from the (then only) flat-color-overwrite
+    path.
+    """
+    meta_path = Path(out_root) / sid / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    return meta.get("injection_mode", "flat")
+
+
 def _write_frames(frames: list[np.ndarray], out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     for i, frame_rgb in enumerate(frames):
@@ -53,6 +65,7 @@ def write_sample(
     out_root: Path,
     clip_id: str,
     index: int,
+    injection_mode: str,
 ) -> str:
     sid = sample_id(clip_id, sample.profile_name, sample.pattern, index)
     sample_dir = Path(out_root) / sid
@@ -64,6 +77,7 @@ def write_sample(
         "clip_id": clip_id,
         "profile": sample.profile_name,
         "pattern": sample.pattern,
+        "injection_mode": injection_mode,
         "injected_window": dataclasses.asdict(sample.window),
         "segments": [dataclasses.asdict(s) for s in sample.segments],
     }

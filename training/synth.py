@@ -10,7 +10,12 @@ import numpy as np
 from detector.pipeline import run_detection
 from detector.profiles import ThresholdProfile
 from detector.segments import RiskSegment
-from training.injection import inject_general_flash, inject_red_flash
+from training.injection import (
+    inject_general_flash,
+    inject_general_flash_realistic,
+    inject_red_flash,
+    inject_red_flash_realistic,
+)
 from training.params import InjectionWindow, SynthParams, sample_synthesis_params
 
 
@@ -64,6 +69,47 @@ def synthesize_sample(
                 profile_name=profile.name,
                 window=params.window,
                 clean_frames=clean_frames,  # intentional alias, not a copy — see dataclass field
+                degraded_frames=degraded_frames,
+                segments=segments,
+            )
+    return None
+
+
+def _apply_pattern_realistic(clean_frames: list[np.ndarray], params: SynthParams) -> list[np.ndarray]:
+    if params.pattern == "general":
+        return inject_general_flash_realistic(clean_frames, params.window)
+    return inject_red_flash_realistic(clean_frames, params.window)
+
+
+def synthesize_sample_realistic(
+    clean_frames: list[np.ndarray],
+    fps: float,
+    profile: ThresholdProfile,
+    pattern: str,
+    rng: np.random.Generator,
+    max_retries: int = 5,
+) -> SynthesizedSample | None:
+    """Same retry-and-validate structure as synthesize_sample, but injects
+    with the linear-space gain functions instead of the flat-color-overwrite
+    ones. sample_synthesis_params is reused only for its InjectionWindow
+    (position/size/timing) -- its dark_target/bright_target/red_rgb/
+    baseline_rgb fields are computed but unused here, since the realistic
+    path uses fixed gain constants (see training.injection) rather than
+    per-profile absolute targets."""
+    frame_height, frame_width = clean_frames[0].shape[:2]
+
+    for _ in range(max_retries):
+        params = sample_synthesis_params(
+            profile, pattern, len(clean_frames), frame_height, frame_width, fps, rng
+        )
+        degraded_frames = _apply_pattern_realistic(clean_frames, params)
+        _, segments = run_detection(degraded_frames, fps=fps, profile=profile, margin_seconds=0.0)
+        if _window_is_covered(params.window, segments):
+            return SynthesizedSample(
+                pattern=pattern,
+                profile_name=profile.name,
+                window=params.window,
+                clean_frames=clean_frames,
                 degraded_frames=degraded_frames,
                 segments=segments,
             )

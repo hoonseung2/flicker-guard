@@ -2,7 +2,12 @@ import numpy as np
 
 from detector.flash import red_flash_mask, transition_mask
 from detector.luminance import relative_luminance
-from training.injection import inject_general_flash, inject_red_flash
+from training.injection import (
+    inject_general_flash,
+    inject_general_flash_realistic,
+    inject_red_flash,
+    inject_red_flash_realistic,
+)
 from training.params import InjectionWindow
 
 
@@ -122,3 +127,54 @@ def test_inject_red_flash_offset_window_submask_and_multiframe_period():
             assert region[:, :, channel].min() == region[:, :, channel].max() == np.float32(value), (
                 f"offset {offset} channel {channel}"
             )
+
+
+def test_inject_general_flash_realistic_leaves_frames_outside_window_untouched():
+    frames = _solid_frames(10, 20, 20, 0.5)
+    window = InjectionWindow(start_frame=3, end_frame=6, mask_top=0, mask_left=0, mask_height=20, mask_width=20, period_frames=1, ramp_frames=1)
+    out = inject_general_flash_realistic(frames, window)
+    assert np.array_equal(out[0], frames[0])
+    assert np.array_equal(out[9], frames[9])
+
+
+def test_inject_general_flash_realistic_leaves_pixels_outside_mask_untouched():
+    frames = _solid_frames(6, 20, 20, 0.5)
+    window = InjectionWindow(start_frame=1, end_frame=4, mask_top=5, mask_left=5, mask_height=5, mask_width=5, period_frames=1, ramp_frames=1)
+    out = inject_general_flash_realistic(frames, window)
+    assert np.array_equal(out[2][0:5, :, :], frames[2][0:5, :, :])
+    assert frames[2][0, 0, 0] == 0.5  # input untouched
+
+
+def test_inject_general_flash_realistic_preserves_texture():
+    # Unlike inject_general_flash (flat overwrite), the two halves must stay
+    # visibly different from each other after injection -- a flat overwrite
+    # would collapse both to the same value.
+    frame = np.zeros((10, 10, 3), dtype=np.float32)
+    frame[0:5, :, :] = 0.2
+    frame[5:10, :, :] = 0.6
+    frames = [frame.copy() for _ in range(6)]
+    window = InjectionWindow(start_frame=1, end_frame=4, mask_top=0, mask_left=0, mask_height=10, mask_width=10, period_frames=1, ramp_frames=1)
+    out = inject_general_flash_realistic(frames, window, gain_dark=0.3, gain_bright=3.0)
+    assert not np.allclose(out[2][0:5], out[2][5:10])
+
+
+def test_inject_general_flash_realistic_transitions_are_flagged_by_detector():
+    rng = np.random.default_rng(0)
+    frame = rng.uniform(0.1, 0.9, size=(20, 20, 3)).astype(np.float32)
+    frames = [frame.copy() for _ in range(8)]
+    window = InjectionWindow(start_frame=1, end_frame=6, mask_top=0, mask_left=0, mask_height=20, mask_width=20, period_frames=1, ramp_frames=1)
+    out = inject_general_flash_realistic(frames, window, gain_dark=0.3, gain_bright=3.0)
+    lum2 = relative_luminance(out[2])
+    lum3 = relative_luminance(out[3])
+    mask = transition_mask(lum2, lum3, dark_threshold=0.80, delta_threshold=0.10)
+    assert mask.mean() > 0.9  # measured 0.9875 on this exact fixture
+
+
+def test_inject_red_flash_realistic_transitions_are_flagged_by_detector():
+    rng = np.random.default_rng(0)
+    frame = rng.uniform(0.1, 0.9, size=(10, 10, 3)).astype(np.float32)
+    frames = [frame.copy() for _ in range(6)]
+    window = InjectionWindow(start_frame=1, end_frame=4, mask_top=0, mask_left=0, mask_height=10, mask_width=10, period_frames=1, ramp_frames=1)
+    out = inject_red_flash_realistic(frames, window)
+    mask = red_flash_mask(out[2], out[3], saturation_ratio_threshold=0.80)
+    assert mask.mean() > 0.9  # measured 0.95 on this exact fixture
