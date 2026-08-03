@@ -8,6 +8,7 @@ than the zero-margin check DatasetSynth's validation uses -- Mitigator will
 only ever receive margin-padded segments from BufferManager in production, so
 PriorCalc's notion of "risky" should match what Mitigator actually sees.
 """
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -26,11 +27,17 @@ class FramePrior:
 
 
 def compute_prior(
-    frames: list[np.ndarray],
+    frames: Iterable[np.ndarray],
     fps: float,
     profile: ThresholdProfile,
     n_bins: int = 64,
 ) -> list[FramePrior]:
+    # Materialise first: unlike run_detection*, compute_prior needs `frames`
+    # twice (once for detection, once to re-derive each frame's histogram).
+    # A one-shot iterable -- e.g. detector.cli.read_video_frames, which
+    # returns a generator -- would be drained by run_detection_with_masks and
+    # the later zip would then silently yield an empty result.
+    frames = list(frames)
     scores, segments, masks = run_detection_with_masks(frames, fps=fps, profile=profile)
 
     risky_frame_indices = set()
