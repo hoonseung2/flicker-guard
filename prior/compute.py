@@ -22,6 +22,23 @@ from prior.histogram import TargetHistogramSmoother, compute_illumination_histog
 @dataclass
 class FramePrior:
     frame_index: int
+    # `target_histogram` is None whenever no clean (non-risky, non-uncertain)
+    # frame has been seen yet -- there is nothing to average and nothing to
+    # fall back to. This is the ROUTINE, EXPECTED case for a clip's opening
+    # stretch, not an error path:
+    #
+    # - Detector's WindowedFlashCounter needs a full trailing second before it
+    #   stops reporting `uncertain`, so *every* clip has None targets for at
+    #   least its first `round(fps)` frames -- on a clip shorter than one
+    #   second, that is every frame.
+    # - Any additional prefix before the first genuinely clean frame is ever
+    #   seen is also None. Measured on an 80-frame 10 fps clip with a hazard
+    #   injected at frames 10-20, i.e. starting right as the priming window
+    #   ends: frames 0-31 were None, not just 0-9.
+    #
+    # Callers (Mitigator) must treat None as normal input and handle it
+    # explicitly -- skip conditioning, hold the previous target, or exclude the
+    # frame from training -- rather than as an exceptional/failed computation.
     target_histogram: np.ndarray | None
     mask: np.ndarray
 
