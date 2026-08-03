@@ -2,6 +2,7 @@ import json
 
 import cv2
 import numpy as np
+import pytest
 
 from training.cli import main, run_batch
 
@@ -91,3 +92,164 @@ def test_main_writes_summary_json(tmp_path):
     assert exit_code == 0
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["accepted"] == 2
+
+
+def _sample_bytes(sample_dir):
+    return {
+        path.relative_to(sample_dir).as_posix(): path.read_bytes()
+        for path in sorted(sample_dir.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _standard_inputs(tmp_path):
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    _write_clip(clips_dir / "bear.mp4")
+    profiles_dir = tmp_path / "profiles"
+    _write_profiles_dir(profiles_dir)
+    return clips_dir, profiles_dir
+
+
+def test_run_batch_output_is_identical_whether_or_not_earlier_samples_were_skipped(tmp_path):
+    # Each sample's parameters must be a pure function of (seed, sample_id).
+    # With a single shared rng stream, resume-skipped combos consumed no draws
+    # and every later sample got a different (duplicated) draw instead.
+    clips_dir, profiles_dir = _standard_inputs(tmp_path)
+
+    straight = tmp_path / "straight"
+    run_batch(clips_dir, profiles_dir, straight, samples_per_combo=2, seed=7)
+
+    resumed = tmp_path / "resumed"
+    run_batch(clips_dir, profiles_dir, resumed, samples_per_combo=1, seed=7)
+    second = run_batch(clips_dir, profiles_dir, resumed, samples_per_combo=2, seed=7)
+
+    assert second["skipped_existing"] == 2
+    assert second["accepted"] == 2
+
+    for sid in (
+        "bear__tiny__general__000", "bear__tiny__general__001",
+        "bear__tiny__red__000", "bear__tiny__red__001",
+    ):
+        assert _sample_bytes(straight / sid) == _sample_bytes(resumed / sid), sid
+
+
+def test_run_batch_does_not_duplicate_synthesized_samples_within_a_run(tmp_path):
+    clips_dir, profiles_dir = _standard_inputs(tmp_path)
+    out_dir = tmp_path / "out"
+    run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=3, seed=7)
+
+    windows = [
+        json.loads((out_dir / f"bear__tiny__general__{i:03d}" / "meta.json").read_text(encoding="utf-8"))[
+            "injected_window"
+        ]
+        for i in range(3)
+    ]
+    assert len({w["start_frame"] for w in windows}) > 1
+
+
+def test_run_batch_raises_when_profiles_dir_is_missing(tmp_path):
+    clips_dir, _ = _standard_inputs(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        run_batch(clips_dir, tmp_path / "nope", tmp_path / "out", samples_per_combo=1, seed=0)
+
+
+def test_run_batch_raises_when_profiles_dir_has_no_profiles(tmp_path):
+    clips_dir, _ = _standard_inputs(tmp_path)
+    empty = tmp_path / "empty-profiles"
+    empty.mkdir()
+    with pytest.raises(FileNotFoundError):
+        run_batch(clips_dir, empty, tmp_path / "out", samples_per_combo=1, seed=0)
+
+
+def test_run_batch_raises_when_clips_dir_is_missing(tmp_path):
+    _, profiles_dir = _standard_inputs(tmp_path)
+    with pytest.raises(FileNotFoundError):
+        run_batch(tmp_path / "nope", profiles_dir, tmp_path / "out", samples_per_combo=1, seed=0)
+
+
+def test_run_batch_reports_zero_clips_found_instead_of_silently_succeeding(tmp_path):
+    _, profiles_dir = _standard_inputs(tmp_path)
+    empty_clips = tmp_path / "empty-clips"
+    empty_clips.mkdir()
+
+    summary = run_batch(empty_clips, profiles_dir, tmp_path / "out", samples_per_combo=1, seed=0)
+
+    assert summary["clips_found"] == 0
+    assert summary["accepted"] == 0
+
+
+def test_run_batch_reports_clips_found_count(tmp_path):
+    clips_dir, profiles_dir = _standard_inputs(tmp_path)
+    summary = run_batch(clips_dir, profiles_dir, tmp_path / "out", samples_per_combo=1, seed=0)
+    assert summary["clips_found"] == 1
+
+
+def test_run_batch_records_clip_too_short(tmp_path):
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    _write_clip(clips_dir / "stub.mp4", n_frames=8)
+    profiles_dir = tmp_path / "profiles"
+    _write_profiles_dir(profiles_dir)
+
+    summary = run_batch(clips_dir, profiles_dir, tmp_path / "out", samples_per_combo=1, seed=0)
+
+    assert summary["accepted"] == 0
+    assert summary["failed"] == 2  # general + red
+    assert [d["reason"] for d in summary["failed_details"]] == ["clip_too_short", "clip_too_short"]
+    assert summary["by_profile_pattern"]["tiny/general"]["failed"] == 1
+
+
+def test_run_batch_overwrite_regenerates_existing_samples(tmp_path):
+    clips_dir, profiles_dir = _standard_inputs(tmp_path)
+    out_dir = tmp_path / "out"
+
+    run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1, seed=0)
+    meta_path = out_dir / "bear__tiny__general__000" / "meta.json"
+    meta_path.write_text(json.dumps({"stale": True}), encoding="utf-8")
+
+    summary = run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1, seed=0, overwrite=True)
+
+    assert summary["skipped_existing"] == 0
+    assert summary["accepted"] == 2
+    assert json.loads(meta_path.read_text(encoding="utf-8"))["clip_id"] == "bear"
+
+
+def test_main_overwrite_flag_bypasses_the_resume_skip(tmp_path):
+    clips_dir, profiles_dir = _standard_inputs(tmp_path)
+    out_dir = tmp_path / "out"
+    argv = [
+        "--clips-dir", str(clips_dir),
+        "--profiles-dir", str(profiles_dir),
+        "--output", str(out_dir),
+    ]
+
+    assert main(argv) == 0
+    assert json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))["skipped_existing"] == 0
+    assert main(argv) == 0
+    assert json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))["skipped_existing"] == 2
+
+    assert main(argv + ["--overwrite"]) == 0
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["skipped_existing"] == 0
+    assert summary["accepted"] == 2
+
+
+def test_run_batch_summary_reports_per_profile_pattern_breakdown(tmp_path):
+    clips_dir, profiles_dir = _standard_inputs(tmp_path)
+    out_dir = tmp_path / "out"
+
+    first = run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1, seed=0)
+    assert first["by_profile_pattern"]["tiny/general"] == {
+        "accepted": 1, "skipped_existing": 0, "failed": 0,
+    }
+    assert first["by_profile_pattern"]["tiny/red"] == {
+        "accepted": 1, "skipped_existing": 0, "failed": 0,
+    }
+    # the global totals stay alongside the breakdown
+    assert first["accepted"] == 2
+
+    second = run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1, seed=0)
+    assert second["by_profile_pattern"]["tiny/general"] == {
+        "accepted": 0, "skipped_existing": 1, "failed": 0,
+    }
