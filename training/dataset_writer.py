@@ -1,6 +1,21 @@
 """Writes an accepted SynthesizedSample to disk as a clean/degraded PNG
 frame-sequence pair plus a metadata JSON, and supports resuming an
-interrupted batch by skipping samples that already exist."""
+interrupted batch by skipping samples that already exist.
+
+`meta.json` is written last, on purpose: `sample_exists` keys off it, so a
+directory without it is an incomplete write that the next run redoes.
+`_write_frames` therefore has to raise on a failed frame write rather than
+let `cv2.imwrite`'s `False` return slip through — a truncated sample that
+still got its `meta.json` would be skipped by every future resume run,
+permanently.
+
+Storage-cost tradeoff (accepted, not a bug): every (clip, profile, pattern)
+combination stores its own full copy of the clean frames, so a clip run
+against 6 profiles x 2 patterns holds 12 identical clean copies on disk.
+That is deliberate — each sample directory stays self-contained and
+independently loadable/movable, which is worth more here than the disk
+saved by de-duplicating clean frames behind a shared store.
+"""
 import dataclasses
 import json
 from pathlib import Path
@@ -25,7 +40,12 @@ def _write_frames(frames: list[np.ndarray], out_dir: Path) -> None:
         frame_bgr_uint8 = cv2.cvtColor(
             np.clip(frame_rgb * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR
         )
-        cv2.imwrite(str(out_dir / f"{i:06d}.png"), frame_bgr_uint8)
+        frame_path = out_dir / f"{i:06d}.png"
+        # cv2.imwrite returns False instead of raising on disk-full,
+        # permission failure or path-length overflow. Make that behave like a
+        # crash so the sample never reaches its meta.json (see module docstring).
+        if not cv2.imwrite(str(frame_path), frame_bgr_uint8):
+            raise OSError(f"cv2.imwrite failed to write frame: {frame_path}")
 
 
 def write_sample(

@@ -1,7 +1,9 @@
 import json
 
 import numpy as np
+import pytest
 
+import training.dataset_writer as dataset_writer
 from detector.segments import RiskSegment
 from training.dataset_writer import sample_exists, sample_id, write_sample
 from training.params import InjectionWindow
@@ -44,3 +46,18 @@ def test_sample_exists_true_after_write_false_before(tmp_path):
     assert not sample_exists(tmp_path, sid)
     write_sample(_sample(), tmp_path, clip_id="bear", index=0)
     assert sample_exists(tmp_path, sid)
+
+
+def test_write_sample_raises_and_writes_no_meta_when_a_frame_write_fails(tmp_path, monkeypatch):
+    # cv2.imwrite returns False (it does not raise) on disk-full / permission
+    # / path-length failures. If meta.json were still written, sample_exists
+    # would report the truncated sample as complete and every future resume
+    # run would skip it forever.
+    monkeypatch.setattr(dataset_writer.cv2, "imwrite", lambda *args, **kwargs: False)
+
+    with pytest.raises(OSError):
+        write_sample(_sample(), tmp_path, clip_id="bear", index=0)
+
+    sid = sample_id("bear", "kr", "general", 0)
+    assert not (tmp_path / sid / "meta.json").exists()
+    assert not sample_exists(tmp_path, sid)
