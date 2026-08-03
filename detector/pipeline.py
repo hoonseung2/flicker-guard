@@ -1,3 +1,4 @@
+# flicker-guard/detector/pipeline.py
 """Wires the luminance / motion / flash / scoring / segment modules into a
 single call that scans a full frame sequence.
 
@@ -10,10 +11,10 @@ Threshold Algorithm, not an implementation of it:
   roughly 2x the true visual flash rate (conservative, see
   `detector/scoring.py`).
 - `ThresholdProfile` encodes only a flash-frequency limit and a flagged-area
-  limit. Ofcom's dark-scene sub-rule (luminance < 160 with contrast >= 20)
-  and Japan's high-contrast pattern-density rule are **not** encoded and are
-  therefore **not** detected (plan Task 5 deferred them to a future schema
-  extension; recorded here per final-review finding I5).
+  limit. Ofcom's dark-scene sub-rule (luminance < 160 with contrast >= 20),
+  Japan's high-contrast pattern-density rule, and WCAG's "25% of any 10-degree
+  visual field" area sub-clause (see README section 9) are **not** encoded
+  and are therefore **not** detected.
 - Motion compensation is global/pan-only; local object motion is not
   compensated and leaves a small residual flagged area at frame borders.
 
@@ -30,8 +31,16 @@ Uncertain edges (final-review finding I4, README section 7): frame 0 has no
 predecessor, so its transition is unknown rather than safe. It is fed to the
 counter as a fully flagged, explicitly unmeasured frame, which can only push
 the verdict toward "risky".
+
+Per-pixel masks (PriorCalc plan): `run_detection` computes a per-pixel flash
+mask for every frame internally and discards it, keeping only the aggregate
+`FlickerScore`. `run_detection_with_masks` is the same detection, sharing the
+same internal per-frame loop (`_iter_scores_and_masks`), but also returns
+those masks -- PriorCalc needs to know *where* in the frame a transition
+happened, not just whether the frame is risky. `run_detection`'s own
+signature and behavior are unchanged by this addition.
 """
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 import numpy as np
 
@@ -43,14 +52,16 @@ from detector.scoring import FlickerScore, WindowedFlashCounter
 from detector.segments import RiskSegment, scores_to_segments
 
 
-def run_detection(
+def _iter_scores_and_masks(
     frames: Iterable[np.ndarray],
     fps: float,
     profile: ThresholdProfile,
-    margin_seconds: float = 0.5,
-) -> tuple[list[FlickerScore], list[RiskSegment]]:
+) -> Iterator[tuple[FlickerScore, np.ndarray]]:
+    """Shared per-frame computation behind run_detection and
+    run_detection_with_masks -- the single source of truth both public
+    functions delegate to, so they can never behaviorally diverge. Not
+    part of the public API."""
     counter = WindowedFlashCounter(fps=fps)
-    scores: list[FlickerScore] = []
 
     prev_rgb = None
     prev_luminance = None
@@ -76,9 +87,34 @@ def run_detection(
                 saturation_ratio_threshold=profile.red_saturation_ratio_threshold,
             )
             uncertain = False
-        scores.append(counter.update(i, mask, uncertain=uncertain))
+        score = counter.update(i, mask, uncertain=uncertain)
+        yield score, mask
         prev_rgb, prev_luminance = frame, curr_luminance
 
+
+def run_detection(
+    frames: Iterable[np.ndarray],
+    fps: float,
+    profile: ThresholdProfile,
+    margin_seconds: float = 0.5,
+) -> tuple[list[FlickerScore], list[RiskSegment]]:
+    scores = [score for score, _mask in _iter_scores_and_masks(frames, fps, profile)]
     margin_frames = round(margin_seconds * fps)
     segments = scores_to_segments(scores, profile, margin_frames, total_frames=len(scores))
     return scores, segments
+
+
+def run_detection_with_masks(
+    frames: Iterable[np.ndarray],
+    fps: float,
+    profile: ThresholdProfile,
+    margin_seconds: float = 0.5,
+) -> tuple[list[FlickerScore], list[RiskSegment], list[np.ndarray]]:
+    scores: list[FlickerScore] = []
+    masks: list[np.ndarray] = []
+    for score, mask in _iter_scores_and_masks(frames, fps, profile):
+        scores.append(score)
+        masks.append(mask)
+    margin_frames = round(margin_seconds * fps)
+    segments = scores_to_segments(scores, profile, margin_frames, total_frames=len(scores))
+    return scores, segments, masks
