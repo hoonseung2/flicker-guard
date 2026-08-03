@@ -92,6 +92,22 @@ def test_getitem_duplicates_boundary_frame_at_clip_end(tmp_path):
     assert torch.equal(center, next_frame)
 
 
+def test_dataset_excludes_risky_frames_with_none_target_histogram(tmp_path):
+    # fps=10 -> Detector's trailing window needs ~10 frames before it stops
+    # reporting uncertain=True, so target_histogram is None for at least
+    # frames 0-9 of any clip. A segment starting at frame 0 straddles that
+    # boundary: frames inside the segment but before priming completes must
+    # be excluded even though they ARE in a risky segment, while frames
+    # after priming (still in the same segment) must be included.
+    _write_fake_sample(tmp_path, "clipF", n_frames=20, fps=10.0,
+                       segments=[{"start_frame": 0, "end_frame": 15}])
+    split = clip_split("clipF")
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=split)
+    frame_indices = sorted(idx for _, idx in dataset._index)
+    assert 0 not in frame_indices  # inside segment, but target_histogram is None this early
+    assert 15 in frame_indices     # inside segment, past priming, target_histogram is valid
+
+
 def test_prior_cache_is_written_and_reused(tmp_path, monkeypatch):
     _write_fake_sample(tmp_path, "clipE", n_frames=20, fps=10.0,
                        segments=[{"start_frame": 12, "end_frame": 15}])
