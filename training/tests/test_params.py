@@ -4,10 +4,10 @@ import numpy as np
 import pytest
 
 from detector.profiles import ThresholdProfile, load_profile
-from training import mask_shapes
 from training.params import (
     ClipTooShortError,
     LightShape,
+    _light_area,
     _sample_one_light,
     sample_lights,
     sample_synthesis_params,
@@ -182,17 +182,10 @@ def test_sample_lights_kinds_are_valid():
 
 
 def test_sample_lights_combined_area_exceeds_profile_ratio():
-    def area_of(light):
-        if light.kind == "rect":
-            return mask_shapes.rect_area(light.half_height, light.half_width)
-        if light.kind == "circle":
-            return mask_shapes.circle_area(light.radius)
-        return mask_shapes.beam_area(light.half_length, light.half_thickness)
-
     rng = np.random.default_rng(0)
     for _ in range(20):
         lights = sample_lights(PROFILE, 100, 100, rng)
-        total_area = sum(area_of(light) for light in lights)
+        total_area = sum(_light_area(light) for light in lights)
         achieved_ratio = total_area / (100 * 100)
         assert achieved_ratio > PROFILE.max_area_ratio
         # Upper bound: per-light target areas are an equal share of at most
@@ -208,11 +201,14 @@ def test_sample_lights_combined_area_exceeds_profile_ratio():
 
 
 def test_sample_lights_positions_are_within_frame_bounds():
+    # rng.uniform(0, frame_height) is half-open ([0, frame_height)), so
+    # frame_height itself (e.g. row 80 for an 80-tall frame) is off-frame --
+    # the upper bound must be strict, not <=.
     rng = np.random.default_rng(0)
     for _ in range(20):
         for light in sample_lights(PROFILE, 80, 60, rng):
-            assert 0 <= light.start_row <= 80 and 0 <= light.end_row <= 80
-            assert 0 <= light.start_col <= 60 and 0 <= light.end_col <= 60
+            assert 0 <= light.start_row < 80 and 0 <= light.end_row < 80
+            assert 0 <= light.start_col < 60 and 0 <= light.end_col < 60
 
 
 def test_sample_lights_rejects_profile_whose_area_target_is_unreachable():
@@ -258,16 +254,9 @@ def test_sample_one_light_area_overshoot_is_bounded_for_every_kind():
     # achieved ratio~=2.05 pre-fix and ~=1.07 post-fix; this asserts the
     # fixed formula stays in the same few-percent range as rect/circle for
     # every kind and several target sizes.
-    def area_of(light):
-        if light.kind == "rect":
-            return mask_shapes.rect_area(light.half_height, light.half_width)
-        if light.kind == "circle":
-            return mask_shapes.circle_area(light.radius)
-        return mask_shapes.beam_area(light.half_length, light.half_thickness)
-
     rng = np.random.default_rng(0)
     for target_area in (5000, 50000):
         for kind in ("rect", "circle", "beam"):
             light = _sample_one_light(kind, target_area, 1000, 1000, rng)
-            overshoot = area_of(light) / target_area
+            overshoot = _light_area(light) / target_area
             assert 0.9 < overshoot < 1.3, f"{kind} at target={target_area}: overshoot={overshoot:.3f}"

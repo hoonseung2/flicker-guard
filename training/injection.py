@@ -61,9 +61,11 @@ def _light_mask_at_offset(
         return mask_shapes.render_rect_mask(frame_height, frame_width, row, col, light.half_height, light.half_width)
     if light.kind == "circle":
         return mask_shapes.render_circle_mask(frame_height, frame_width, row, col, light.radius)
-    return mask_shapes.render_beam_mask(
-        frame_height, frame_width, row, col, light.half_length, light.half_thickness, light.angle_degrees
-    )
+    if light.kind == "beam":
+        return mask_shapes.render_beam_mask(
+            frame_height, frame_width, row, col, light.half_length, light.half_thickness, light.angle_degrees
+        )
+    raise ValueError(f"unknown light kind: {light.kind!r}")
 
 
 def _static_region_mask(window: InjectionWindow, frame_height: int, frame_width: int) -> np.ndarray:

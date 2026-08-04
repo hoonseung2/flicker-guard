@@ -91,11 +91,12 @@ def synthesize_sample_realistic(
 ) -> SynthesizedSample | None:
     """Same retry-and-validate structure as synthesize_sample, but injects
     with the linear-space gain functions instead of the flat-color-overwrite
-    ones. sample_synthesis_params is reused only for its InjectionWindow
-    (position/size/timing) -- its dark_target/bright_target/red_rgb/
-    baseline_rgb fields are computed but unused here, since the realistic
-    path uses fixed gain constants (see training.injection) rather than
-    per-profile absolute targets."""
+    ones. Calls sample_synthesis_params_realistic (not sample_synthesis_params)
+    to get its InjectionWindow (position/size/timing), which also attaches
+    window.lights (the sampled moving shapes) -- its dark_target/
+    bright_target/red_rgb/baseline_rgb fields are computed but unused here,
+    since the realistic path uses fixed gain constants (see
+    training.injection) rather than per-profile absolute targets."""
     frame_height, frame_width = clean_frames[0].shape[:2]
 
     for _ in range(max_retries):
