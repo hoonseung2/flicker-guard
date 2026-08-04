@@ -47,7 +47,15 @@ def mitigate_segment(
     # model to CPU (or vice versa) by hardcoding a device here.
     device = next(model.parameters()).device
     n = len(frames)
-    output = [frame.copy() for frame in frames]
+    # A shallow list copy is enough: nothing in this function ever mutates a
+    # frame array in place (concatenate/resize/assignment all produce new
+    # arrays), only `output[i]` gets reassigned for corrected frames. Deep-
+    # copying every frame here used to double the resident memory of the
+    # whole clip (~5GB extra on a 507-frame 720x1280 clip) for no reason --
+    # on a RAM-constrained host (e.g. free-tier Colab) that was enough to
+    # get the process OOM-killed with no traceback, which looked identical
+    # to a hang.
+    output = list(frames)
 
     corrected_count = 0
     try:
