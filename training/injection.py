@@ -17,7 +17,8 @@ transition.
 """
 import numpy as np
 
-from training.params import InjectionWindow
+from training import mask_shapes
+from training.params import InjectionWindow, LightShape
 
 # WCAG/BT.709 sRGB encode, the algebraic inverse of detector.luminance's
 # decode for the gray case (R=G=B=c): since the BT.709 coefficients sum to
@@ -42,6 +43,42 @@ def _mask_slice(window: InjectionWindow) -> tuple[slice, slice]:
         slice(window.mask_top, window.mask_top + window.mask_height),
         slice(window.mask_left, window.mask_left + window.mask_width),
     )
+
+
+def _interpolate(start: float, end: float, offset: int, span: int) -> float:
+    if span <= 0:
+        return start
+    t = offset / span
+    return start + (end - start) * t
+
+
+def _light_mask_at_offset(
+    light: LightShape, frame_height: int, frame_width: int, offset: int, span: int,
+) -> np.ndarray:
+    row = _interpolate(light.start_row, light.end_row, offset, span)
+    col = _interpolate(light.start_col, light.end_col, offset, span)
+    if light.kind == "rect":
+        return mask_shapes.render_rect_mask(frame_height, frame_width, row, col, light.half_height, light.half_width)
+    if light.kind == "circle":
+        return mask_shapes.render_circle_mask(frame_height, frame_width, row, col, light.radius)
+    return mask_shapes.render_beam_mask(
+        frame_height, frame_width, row, col, light.half_length, light.half_thickness, light.angle_degrees
+    )
+
+
+def _region_mask_at_offset(
+    window: InjectionWindow, frame_height: int, frame_width: int, offset: int,
+) -> np.ndarray:
+    if not window.lights:
+        rows, cols = _mask_slice(window)
+        mask = np.zeros((frame_height, frame_width), dtype=bool)
+        mask[rows, cols] = True
+        return mask
+    span = window.end_frame - window.start_frame
+    mask = np.zeros((frame_height, frame_width), dtype=bool)
+    for light in window.lights:
+        mask |= _light_mask_at_offset(light, frame_height, frame_width, offset, span)
+    return mask
 
 
 def inject_general_flash(
@@ -101,20 +138,24 @@ def inject_general_flash_realistic(
     gain_dark: float = 0.3,
     gain_bright: float = 3.0,
 ) -> list[np.ndarray]:
-    """Alternates the masked region between two *multiplicative* luminance
+    """Alternates the injected region between two *multiplicative* luminance
     gains in linear light space, instead of inject_general_flash's flat
     color overwrite -- this preserves the underlying scene's texture, matching
     how a real light source's intensity change multiplies reflected light
     physically. Gain defaults validated empirically (see plan/spec) to
-    reliably cross Detector's default thresholds on real footage."""
-    rows, cols = _mask_slice(window)
+    reliably cross Detector's default thresholds on real footage. The
+    injected region is window.lights's per-frame union when set (moving
+    shapes), or the legacy static rectangle when not (see
+    _region_mask_at_offset)."""
+    frame_height, frame_width = frames[0].shape[:2]
     out = [frame.copy() for frame in frames]
     for i in range(window.start_frame, window.end_frame + 1):
         offset = i - window.start_frame
         gain = gain_bright if _is_pulse_frame(offset, window.period_frames) else gain_dark
-        region = out[i][rows, cols, :]
+        mask = _region_mask_at_offset(window, frame_height, frame_width, offset)
+        region = out[i][mask, :]
         linear = _srgb_to_linear(region)
-        out[i][rows, cols, :] = _linear_to_srgb(linear * gain)
+        out[i][mask, :] = _linear_to_srgb(linear * gain)
     return out
 
 
@@ -133,14 +174,17 @@ def inject_red_flash_realistic(
     breaking the XOR-based transition Detector relies on. gain magnitudes are
     large because the WCAG saturation-ratio test runs in gamma-compressed
     sRGB space, which compresses a 10x linear channel-ratio difference down
-    to roughly 2.6x -- verified empirically (see plan/spec)."""
-    rows, cols = _mask_slice(window)
+    to roughly 2.6x -- verified empirically (see plan/spec). The injected
+    region is window.lights's per-frame union when set (moving shapes), or
+    the legacy static rectangle when not (see _region_mask_at_offset)."""
+    frame_height, frame_width = frames[0].shape[:2]
     out = [frame.copy() for frame in frames]
     for i in range(window.start_frame, window.end_frame + 1):
         offset = i - window.start_frame
         gains = red_gains if _is_pulse_frame(offset, window.period_frames) else baseline_gains
-        region = out[i][rows, cols, :]
+        mask = _region_mask_at_offset(window, frame_height, frame_width, offset)
+        region = out[i][mask, :]
         linear = _srgb_to_linear(region)
         modulated = linear * np.array(gains, dtype=np.float32)
-        out[i][rows, cols, :] = _linear_to_srgb(modulated)
+        out[i][mask, :] = _linear_to_srgb(modulated)
     return out

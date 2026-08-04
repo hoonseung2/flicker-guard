@@ -8,7 +8,7 @@ from training.injection import (
     inject_red_flash,
     inject_red_flash_realistic,
 )
-from training.params import InjectionWindow
+from training.params import InjectionWindow, LightShape
 
 
 def _solid_frames(n, h, w, value):
@@ -178,3 +178,60 @@ def test_inject_red_flash_realistic_transitions_are_flagged_by_detector():
     out = inject_red_flash_realistic(frames, window)
     mask = red_flash_mask(out[2], out[3], saturation_ratio_threshold=0.80)
     assert mask.mean() > 0.9  # measured 0.95 on this exact fixture
+
+
+def test_inject_general_flash_realistic_with_moving_light_hits_start_then_end_position():
+    frames = _solid_frames(11, 30, 30, 0.5)
+    light = LightShape(kind="circle", start_row=5, start_col=5, end_row=25, end_col=25, radius=2)
+    window = InjectionWindow(
+        start_frame=0, end_frame=10, mask_top=0, mask_left=0, mask_height=1, mask_width=1,
+        period_frames=1, ramp_frames=1, lights=[light],
+    )
+    out = inject_general_flash_realistic(frames, window, gain_dark=0.3, gain_bright=3.0)
+    # At start_frame the light sits near (5,5); its gain (dark, offset 0 is
+    # not a pulse frame per _is_pulse_frame) must have changed that pixel...
+    assert out[0][5, 5, 0] != frames[0][5, 5, 0]
+    assert out[0][25, 25, 0] == frames[0][25, 25, 0]  # end position untouched yet
+    # ...and at end_frame the light has moved to (25,25).
+    assert out[10][25, 25, 0] != frames[10][25, 25, 0]
+    assert out[10][5, 5, 0] == frames[10][5, 5, 0]  # start position no longer lit
+
+
+def test_inject_general_flash_realistic_with_two_lights_unions_both_regions():
+    frames = _solid_frames(4, 30, 30, 0.5)
+    light_a = LightShape(kind="circle", start_row=5, start_col=5, end_row=5, end_col=5, radius=2)
+    light_b = LightShape(kind="circle", start_row=25, start_col=25, end_row=25, end_col=25, radius=2)
+    window = InjectionWindow(
+        start_frame=0, end_frame=3, mask_top=0, mask_left=0, mask_height=1, mask_width=1,
+        period_frames=1, ramp_frames=1, lights=[light_a, light_b],
+    )
+    out = inject_general_flash_realistic(frames, window, gain_dark=0.3, gain_bright=3.0)
+    assert out[0][5, 5, 0] != frames[0][5, 5, 0]
+    assert out[0][25, 25, 0] != frames[0][25, 25, 0]
+    assert out[0][15, 15, 0] == frames[0][15, 15, 0]  # between the two lights: untouched
+
+
+def test_inject_red_flash_realistic_with_moving_light_hits_start_then_end_position():
+    frames = _solid_frames(11, 30, 30, 0.3)
+    light = LightShape(kind="circle", start_row=5, start_col=5, end_row=25, end_col=25, radius=2)
+    window = InjectionWindow(
+        start_frame=0, end_frame=10, mask_top=0, mask_left=0, mask_height=1, mask_width=1,
+        period_frames=1, ramp_frames=1, lights=[light],
+    )
+    out = inject_red_flash_realistic(frames, window)
+    assert not np.array_equal(out[0][5, 5], frames[0][5, 5])
+    assert np.array_equal(out[0][25, 25], frames[0][25, 25])
+    assert not np.array_equal(out[10][25, 25], frames[10][25, 25])
+    assert np.array_equal(out[10][5, 5], frames[10][5, 5])
+
+
+def test_inject_general_flash_realistic_lights_leave_frames_outside_window_untouched():
+    frames = _solid_frames(10, 20, 20, 0.5)
+    light = LightShape(kind="rect", start_row=10, start_col=10, end_row=10, end_col=10, half_height=8, half_width=8)
+    window = InjectionWindow(
+        start_frame=3, end_frame=6, mask_top=0, mask_left=0, mask_height=1, mask_width=1,
+        period_frames=1, ramp_frames=1, lights=[light],
+    )
+    out = inject_general_flash_realistic(frames, window)
+    assert np.array_equal(out[0], frames[0])
+    assert np.array_equal(out[9], frames[9])
