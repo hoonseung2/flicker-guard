@@ -132,7 +132,20 @@ def sample_synthesis_params(
         )
 
     latest_start = clip_frame_count - duration_frames
-    start_frame = int(rng.integers(1, latest_start + 1))
+    # PriorCalc's TargetHistogramSmoother needs a stretch of genuinely clean
+    # (non-risky, non-uncertain) frames before the injected segment to ever
+    # compute a non-None target histogram. Measured on the real 170-sample
+    # dataset: samples whose injected segment started early (median start
+    # ~15% into the clip) contributed zero training examples, while samples
+    # that started around the clip's middle (median ~48%) contributed dozens
+    # each -- see docs/superpowers/specs/2026-08-04-mask-diversification-design.md
+    # section 3. When a clip is too short to offer the full desired runway,
+    # give it as much as the clip can provide rather than rejecting it
+    # outright (ClipTooShortError above already handles clips too short for
+    # the injection window itself).
+    desired_runway = 2 * window_frames
+    min_start = min(desired_runway, latest_start)
+    start_frame = int(rng.integers(min_start, latest_start + 1))
     end_frame = start_frame + duration_frames - 1
 
     mask_top, mask_left, mask_height, mask_width = _mask_dims(

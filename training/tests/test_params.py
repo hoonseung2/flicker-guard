@@ -129,3 +129,31 @@ def test_sample_synthesis_params_exceeds_each_shipped_profile(filename):
     window_frames = round(30.0)
     flagged_per_window = window_frames // params.window.period_frames
     assert flagged_per_window > profile.max_flashes_per_second
+
+
+def test_sample_synthesis_params_prefers_a_start_with_full_runway_when_clip_allows_it():
+    # fps=24 -> window_frames=24, desired_runway=2*24=48. A 200-frame clip
+    # gives latest_start = 200 - duration_frames, comfortably above 48, so
+    # every draw should land at or beyond the runway target.
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        params = sample_synthesis_params(
+            PROFILE, "general", clip_frame_count=200, frame_height=100, frame_width=100, fps=24.0, rng=rng
+        )
+        assert params.window.start_frame >= 48
+
+
+def test_sample_synthesis_params_squeezes_start_to_latest_when_clip_too_short_for_full_runway():
+    # fps=24 -> window_frames=24; PROFILE's max_flashes_per_second=3 ->
+    # period_frames = 24 // (2*4) = 3 -> duration_frames = 24 + 12 = 36.
+    # clip_frame_count=40 -> latest_start = 40 - 36 = 4, well under the
+    # desired_runway of 48 -- the clip cannot offer full runway, so
+    # start_frame must be squeezed to exactly latest_start (the only value
+    # that still leaves room for the full injection window).
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        params = sample_synthesis_params(
+            PROFILE, "general", clip_frame_count=40, frame_height=100, frame_width=100, fps=24.0, rng=rng
+        )
+        assert params.window.start_frame == 4
+        assert params.window.end_frame == 4 + 36 - 1
