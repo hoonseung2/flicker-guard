@@ -63,19 +63,94 @@ def test_checkpoint_save_and_load_restores_model_and_optimizer_state(tmp_path):
     train_one_epoch(model, optimizer, dataloader, device="cpu")
 
     checkpoint_path = tmp_path / "checkpoint.pt"
-    save_checkpoint(checkpoint_path, model, optimizer, epoch=2)
+    save_checkpoint(checkpoint_path, model, optimizer, epoch=2, best_val_loss=0.5)
 
     new_model = MitigatorNet()
     new_optimizer = torch.optim.AdamW(new_model.parameters(), lr=1e-3)
-    restored_epoch = load_checkpoint(checkpoint_path, new_model, new_optimizer)
+    restored_epoch, restored_best_val_loss = load_checkpoint(checkpoint_path, new_model, new_optimizer)
 
     assert restored_epoch == 2
+    assert restored_best_val_loss == 0.5
     for p1, p2 in zip(model.parameters(), new_model.parameters()):
         assert torch.equal(p1, p2)
 
     orig_state = list(optimizer.state.values())[0]
     new_state = list(new_optimizer.state.values())[0]
     assert torch.equal(orig_state["exp_avg"], new_state["exp_avg"])
+
+
+def test_load_checkpoint_defaults_best_val_loss_to_inf_for_legacy_checkpoints(tmp_path):
+    # A checkpoint written before best_val_loss was tracked has no such key
+    # -- load_checkpoint must not raise, and must fall back to inf so a
+    # resumed run's first epoch can still win against it, same as a fresh run.
+    model = MitigatorNet()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    checkpoint_path = tmp_path / "legacy_checkpoint.pt"
+    torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": 0}, checkpoint_path)
+
+    new_model = MitigatorNet()
+    new_optimizer = torch.optim.AdamW(new_model.parameters(), lr=1e-3)
+    _, best_val_loss = load_checkpoint(checkpoint_path, new_model, new_optimizer)
+
+    assert best_val_loss == float("inf")
+
+
+def test_checkpoint_resume_round_trip_does_not_raise_on_cpu(tmp_path):
+    # CPU can't reproduce the device-mismatch RuntimeError this guards
+    # against (see the CUDA variant below), but it does catch a regression
+    # to resume raising for any other reason -- e.g. a checkpoint/optimizer
+    # API mismatch.
+    torch.manual_seed(0)
+    model = MitigatorNet()
+    model.to("cpu")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    dataloader = torch.utils.data.DataLoader(_FixedBatchDataset(), batch_size=4)
+    train_one_epoch(model, optimizer, dataloader, device="cpu")
+
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    save_checkpoint(checkpoint_path, model, optimizer, epoch=0, best_val_loss=0.5)
+
+    new_model = MitigatorNet()
+    new_model.to("cpu")
+    new_optimizer = torch.optim.AdamW(new_model.parameters(), lr=1e-3)
+    load_checkpoint(checkpoint_path, new_model, new_optimizer)
+
+    for param in new_model.parameters():
+        assert param.device.type == "cpu"
+    for state in new_optimizer.state.values():
+        assert state["exp_avg"].device.type == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_checkpoint_resume_round_trip_keeps_optimizer_state_on_model_device_gpu(tmp_path):
+    # Regression test for the --resume device-mismatch bug: main() used to
+    # build the optimizer over CPU params and move the model to the GPU only
+    # inside train_one_epoch, so a resumed AdamW's exp_avg/exp_avg_sq stayed
+    # on CPU while gradients were computed on CUDA -- load_checkpoint would
+    # then raise a device-mismatch RuntimeError on the next optimizer.step().
+    torch.manual_seed(0)
+    model = MitigatorNet()
+    model.to("cuda")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    dataloader = torch.utils.data.DataLoader(_FixedBatchDataset(), batch_size=4)
+    train_one_epoch(model, optimizer, dataloader, device="cuda")
+
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    save_checkpoint(checkpoint_path, model, optimizer, epoch=0, best_val_loss=0.5)
+
+    new_model = MitigatorNet()
+    new_model.to("cuda")
+    new_optimizer = torch.optim.AdamW(new_model.parameters(), lr=1e-3)
+    load_checkpoint(checkpoint_path, new_model, new_optimizer)
+
+    for param in new_model.parameters():
+        assert param.device.type == "cuda"
+    for state in new_optimizer.state.values():
+        assert state["exp_avg"].device.type == "cuda"
+
+    # The real bug surfaced on the next optimizer.step() after resume, not
+    # on load itself -- exercise one more training step to be sure.
+    train_one_epoch(new_model, new_optimizer, dataloader, device="cuda")
 
 
 def test_train_one_epoch_raises_clearly_on_nan_loss(monkeypatch):
@@ -98,10 +173,8 @@ def test_train_one_epoch_raises_clearly_on_nan_loss(monkeypatch):
 
 
 def test_patch_collate_fn_crops_window_mask_clean_to_requested_size():
-    """Test that collate_fn crops spatial tensors to patch_size."""
     collate_fn = _make_patch_collate_fn(patch_size=8)
 
-    # Create a batch of 2 examples (each 16x16)
     batch = [
         {
             "window": torch.rand(9, 16, 16),
@@ -119,21 +192,20 @@ def test_patch_collate_fn_crops_window_mask_clean_to_requested_size():
 
     collated = collate_fn(batch)
 
-    # All spatial tensors should be cropped to 8x8
     assert collated["window"].shape == (2, 9, 8, 8), f"Got {collated['window'].shape}"
     assert collated["mask"].shape == (2, 1, 8, 8)
     assert collated["clean"].shape == (2, 3, 8, 8)
-    # Histogram should be unchanged
     assert collated["histogram"].shape == (2, 64)
 
 
 def test_patch_collate_fn_applies_same_offset_to_window_mask_clean():
-    """Test that the same random crop offset is applied to window, mask, and clean."""
+    # window, mask, and clean must share the same random crop offset --
+    # cropping them independently would misalign the training pair.
     torch.manual_seed(42)
     collate_fn = _make_patch_collate_fn(patch_size=8)
 
-    # Create position-encoded tensors: each spatial location (i,j) has value i*16 + j
-    # This lets us infer the crop offset by reading back the first value
+    # Encoding each position as i*16 + j lets the crop offset be recovered
+    # from a single value after cropping, without tracking it separately.
     def make_position_encoded(shape):
         c, h, w = shape
         tensor = torch.zeros(c, h, w)
@@ -157,13 +229,11 @@ def test_patch_collate_fn_applies_same_offset_to_window_mask_clean():
 
     collated = collate_fn(batch)
 
-    # Extract the cropped tensors
-    cropped_window = collated["window"][0]  # (9, 8, 8)
-    cropped_mask = collated["mask"][0]      # (1, 8, 8)
-    cropped_clean = collated["clean"][0]    # (3, 8, 8)
+    cropped_window = collated["window"][0]
+    cropped_mask = collated["mask"][0]
+    cropped_clean = collated["clean"][0]
 
-    # Infer crop offset from the first value in each cropped tensor
-    # Position (i,j) was encoded as i*16 + j, so top=val//16, left=val%16
+    # Inverts the i*16 + j encoding above: top=val//16, left=val%16.
     def infer_offset(cropped_tensor):
         first_val = cropped_tensor[0, 0, 0].item()
         top = int(first_val // 16)
@@ -174,7 +244,6 @@ def test_patch_collate_fn_applies_same_offset_to_window_mask_clean():
     mask_offset = infer_offset(cropped_mask)
     clean_offset = infer_offset(cropped_clean)
 
-    # All three must have been cropped with the exact same offset
     assert window_offset == mask_offset, \
         f"window offset {window_offset} != mask offset {mask_offset}"
     assert window_offset == clean_offset, \
@@ -182,10 +251,9 @@ def test_patch_collate_fn_applies_same_offset_to_window_mask_clean():
 
 
 def test_patch_collate_fn_clamps_to_actual_size_for_small_frames():
-    """Test that frames smaller than patch_size are handled without crashing."""
+    # patch_size (256) exceeds the frame size (8x8) -- must clamp, not crash.
     collate_fn = _make_patch_collate_fn(patch_size=256)
 
-    # Create a batch with tiny frames (8x8) which is much smaller than patch_size (256)
     batch = [
         {
             "window": torch.rand(9, 8, 8),
@@ -197,19 +265,16 @@ def test_patch_collate_fn_clamps_to_actual_size_for_small_frames():
 
     collated = collate_fn(batch)
 
-    # Should be clamped to actual size (8x8), not crash
     assert collated["window"].shape == (1, 9, 8, 8)
     assert collated["mask"].shape == (1, 1, 8, 8)
     assert collated["clean"].shape == (1, 3, 8, 8)
 
 
 def test_train_one_epoch_with_patch_collate_fn():
-    """Integration test: train_one_epoch runs end-to-end with a cropping collate_fn."""
     torch.manual_seed(0)
     model = MitigatorNet()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-    # Create a dataloader with cropping collate_fn
     collate_fn = _make_patch_collate_fn(patch_size=8)
     dataloader = torch.utils.data.DataLoader(
         _FixedBatchDataset(h=16, w=16, n=4),
@@ -217,7 +282,6 @@ def test_train_one_epoch_with_patch_collate_fn():
         collate_fn=collate_fn,
     )
 
-    # Should not crash
     loss = train_one_epoch(model, optimizer, dataloader, device="cpu")
     assert loss == loss  # finite check (NaN != NaN)
     assert loss != float("inf")

@@ -17,18 +17,33 @@ from training.mitigator_dataset import MitigatorDataset
 from training.mitigator_losses import l1_ssim_loss, psnr
 
 
-def save_checkpoint(path: Path, model: MitigatorNet, optimizer: torch.optim.Optimizer, epoch: int) -> None:
+def save_checkpoint(
+    path: Path,
+    model: MitigatorNet,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    best_val_loss: float = float("inf"),
+) -> None:
     torch.save(
-        {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch},
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_val_loss": best_val_loss,
+        },
         path,
     )
 
 
-def load_checkpoint(path: Path, model: MitigatorNet, optimizer: torch.optim.Optimizer) -> int:
-    checkpoint = torch.load(path, map_location="cpu")
+def load_checkpoint(path: Path, model: MitigatorNet, optimizer: torch.optim.Optimizer) -> tuple[int, float]:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
-    return checkpoint["epoch"]
+    # Older checkpoints (written before best_val_loss was tracked) have no
+    # such field -- fall back to inf rather than raising, since a checkpoint
+    # missing the field is not a corrupted checkpoint, just an older one.
+    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+    return checkpoint["epoch"], best_val_loss
 
 
 def train_one_epoch(
@@ -38,7 +53,6 @@ def train_one_epoch(
     device: str,
 ) -> float:
     model.train()
-    model.to(device)
     total_loss = 0.0
     n_batches = 0
     for batch in dataloader:
@@ -68,7 +82,6 @@ def train_one_epoch(
 
 def evaluate(model: MitigatorNet, dataloader: DataLoader, device: str) -> dict:
     model.eval()
-    model.to(device)
     total_loss = 0.0
     total_psnr = 0.0
     n_batches = 0
@@ -156,34 +169,58 @@ def main(argv: list[str] | None = None) -> int:
 
     train_dataset = MitigatorDataset(Path(args.data_dir), profile, split="train")
     val_dataset = MitigatorDataset(Path(args.data_dir), profile, split="val")
+    print(
+        f"train split: {len(train_dataset)} examples from "
+        f"{train_dataset.samples_contributing}/{train_dataset.samples_scanned} contributing samples"
+    )
+    print(
+        f"val split: {len(val_dataset)} examples from "
+        f"{val_dataset.samples_contributing}/{val_dataset.samples_scanned} contributing samples"
+    )
+    if len(train_dataset) == 0:
+        raise ValueError(
+            "train split has 0 examples -- check --data-dir and --profile "
+            "(no risky, prior-conditioned frame in any train-split sample)"
+        )
+    if len(val_dataset) == 0:
+        raise ValueError(
+            "val split has 0 examples -- check --data-dir and --profile "
+            "(no risky, prior-conditioned frame in any val-split sample)"
+        )
 
-    # Create collate function if patch_size is specified
+    # Create collate function if patch_size is specified. Validation is
+    # deliberately excluded: a random crop makes every epoch's val loss
+    # partly a function of crop luck rather than model quality, which would
+    # make the best.pt comparison noisy -- val always runs at full
+    # resolution, train-only VRAM limiting is what --patch-size is for.
     collate_fn = None
     if args.patch_size is not None:
         collate_fn = _make_patch_collate_fn(args.patch_size)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=None)
 
     model = MitigatorNet()
+    model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     start_epoch = 0
+    best_val_loss = float("inf")
     latest_path = checkpoint_dir / "latest.pt"
     if args.resume and latest_path.exists():
-        start_epoch = load_checkpoint(latest_path, model, optimizer) + 1
+        resumed_epoch, best_val_loss = load_checkpoint(latest_path, model, optimizer)
+        start_epoch = resumed_epoch + 1
 
-    best_val_loss = float("inf")
     for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
         train_loss = train_one_epoch(model, optimizer, train_loader, device)
         val_metrics = evaluate(model, val_loader, device)
         elapsed = time.time() - start_time
 
-        save_checkpoint(latest_path, model, optimizer, epoch)
+        save_checkpoint(latest_path, model, optimizer, epoch, best_val_loss)
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
-            save_checkpoint(checkpoint_dir / "best.pt", model, optimizer, epoch)
+            save_checkpoint(checkpoint_dir / "best.pt", model, optimizer, epoch, best_val_loss)
 
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps({
