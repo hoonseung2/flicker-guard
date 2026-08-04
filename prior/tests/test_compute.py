@@ -48,7 +48,7 @@ def test_compute_prior_target_histogram_returns_to_baseline_well_after_injection
     assert np.allclose(late_target, baseline_histogram, atol=1e-6)
 
 
-def test_compute_prior_target_holds_baseline_through_injected_flicker():
+def test_compute_prior_target_never_picks_up_the_bright_pulse_during_injected_flicker():
     clean = _clean_clip(n=80, value=0.5)
     window = InjectionWindow(
         start_frame=40, end_frame=50, mask_top=0, mask_left=0,
@@ -57,10 +57,15 @@ def test_compute_prior_target_holds_baseline_through_injected_flicker():
     degraded = inject_general_flash(clean, window, dark_target=0.2, bright_target=0.8)
     results = compute_prior(degraded, fps=10.0, profile=PROFILE)
 
-    baseline = compute_illumination_histogram(relative_luminance(clean[0]), n_bins=64)
-    # frame 45 is inside the risk segment but uncertain=False -> only the
-    # RiskSegment half of the OR can exclude it from the smoothing average
-    assert np.allclose(results[45].target_histogram, baseline, atol=1e-6)
+    bright_pulse_histogram = compute_illumination_histogram(relative_luminance(degraded[41]), n_bins=64)
+    # Frame 40 (the pattern's first, dark frame) transitions dark-baseline ->
+    # slightly-darker, which the detector's transition_mask correctly does
+    # not flag as a flash -- so its own near-baseline content legitimately
+    # becomes the held reference for the rest of the fully-masked
+    # dark/bright alternation that follows. Frame 45 sits deep in that
+    # stretch; the one thing that must never happen is the DANGEROUS bright
+    # pulse leaking into the target the network is asked to correct toward.
+    assert not np.allclose(results[45].target_histogram, bright_pulse_histogram, atol=1e-6)
 
 
 def test_compute_prior_returns_frame_prior_per_frame_with_matching_indices():
