@@ -5,7 +5,13 @@ import pytest
 
 from detector.profiles import ThresholdProfile, load_profile
 from training import mask_shapes
-from training.params import ClipTooShortError, LightShape, sample_lights, sample_synthesis_params
+from training.params import (
+    ClipTooShortError,
+    LightShape,
+    _sample_one_light,
+    sample_lights,
+    sample_synthesis_params,
+)
 
 PROFILE = ThresholdProfile(
     name="test", max_flashes_per_second=3, max_area_ratio=0.10,
@@ -186,7 +192,18 @@ def test_sample_lights_combined_area_exceeds_profile_ratio():
     for _ in range(20):
         lights = sample_lights(PROFILE, 100, 100, rng)
         total_area = sum(area_of(light) for light in lights)
-        assert total_area / (100 * 100) > PROFILE.max_area_ratio
+        achieved_ratio = total_area / (100 * 100)
+        assert achieved_ratio > PROFILE.max_area_ratio
+        # Upper bound: per-light target areas are an equal share of at most
+        # _MAX_LIGHTS_AREA_RATIO (0.60) of the frame, and each shape's
+        # round()-derived half-extent should only overshoot its own target
+        # by a few percent (not e.g. the ~2x a squared-term formula error
+        # would produce -- see the beam half_thickness bug this test caught
+        # during review). 1.0 is a generous, easy-to-justify ceiling: it is
+        # far above any plausible few-percent-per-shape overshoot of 0.60,
+        # yet would have caught the old beam formula (which pushed combined
+        # area well past the frame's total pixel count on some profiles).
+        assert achieved_ratio < 1.0
 
 
 def test_sample_lights_positions_are_within_frame_bounds():
@@ -206,3 +223,31 @@ def test_sample_lights_rejects_profile_whose_area_target_is_unreachable():
     rng = np.random.default_rng(0)
     with pytest.raises(ValueError, match="area-cliff"):
         sample_lights(profile, 100, 100, rng)
+
+
+def test_sample_one_light_area_overshoot_is_bounded_for_every_kind():
+    # Regression test for a beam half_thickness formula bug found in review:
+    # dividing the target area by (2 * _BEAM_ASPECT) instead of
+    # (4 * _BEAM_ASPECT) made half_thickness too large by sqrt(2), which
+    # squares into ~2x area overshoot for beams -- while rect/circle only
+    # overshoot their target by a few percent from round(). Exercised
+    # directly against _sample_one_light (rather than through sample_lights)
+    # with a large frame and targets well inside max_half, so the geometric
+    # half_length clamp (frame_side // 2) can't mask the formula's own
+    # overshoot behavior. Reviewer verified target=5000 on a 1000x1000 frame
+    # achieved ratio~=2.05 pre-fix and ~=1.07 post-fix; this asserts the
+    # fixed formula stays in the same few-percent range as rect/circle for
+    # every kind and several target sizes.
+    def area_of(light):
+        if light.kind == "rect":
+            return mask_shapes.rect_area(light.half_height, light.half_width)
+        if light.kind == "circle":
+            return mask_shapes.circle_area(light.radius)
+        return mask_shapes.beam_area(light.half_length, light.half_thickness)
+
+    rng = np.random.default_rng(0)
+    for target_area in (5000, 50000):
+        for kind in ("rect", "circle", "beam"):
+            light = _sample_one_light(kind, target_area, 1000, 1000, rng)
+            overshoot = area_of(light) / target_area
+            assert 0.9 < overshoot < 1.3, f"{kind} at target={target_area}: overshoot={overshoot:.3f}"
