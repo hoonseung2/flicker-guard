@@ -66,14 +66,24 @@ def _light_mask_at_offset(
     )
 
 
-def _region_mask_at_offset(
+def _static_region_mask(window: InjectionWindow, frame_height: int, frame_width: int) -> np.ndarray:
+    """The legacy static rectangle mask, window.lights-empty case. Invariant
+    across the whole injection window (mask_top/left/height/width never
+    change per frame), so callers compute this once before their frame loop
+    rather than calling it per frame -- see _lights_mask_at_offset for the
+    genuinely-per-frame counterpart used when window.lights is populated."""
+    rows, cols = _mask_slice(window)
+    mask = np.zeros((frame_height, frame_width), dtype=bool)
+    mask[rows, cols] = True
+    return mask
+
+
+def _lights_mask_at_offset(
     window: InjectionWindow, frame_height: int, frame_width: int, offset: int,
 ) -> np.ndarray:
-    if not window.lights:
-        rows, cols = _mask_slice(window)
-        mask = np.zeros((frame_height, frame_width), dtype=bool)
-        mask[rows, cols] = True
-        return mask
+    """The window.lights-populated case: a per-frame union of each light's
+    interpolated position, which genuinely differs frame to frame (unlike
+    _static_region_mask) since the lights move."""
     span = window.end_frame - window.start_frame
     mask = np.zeros((frame_height, frame_width), dtype=bool)
     for light in window.lights:
@@ -145,14 +155,17 @@ def inject_general_flash_realistic(
     physically. Gain defaults validated empirically (see plan/spec) to
     reliably cross Detector's default thresholds on real footage. The
     injected region is window.lights's per-frame union when set (moving
-    shapes), or the legacy static rectangle when not (see
-    _region_mask_at_offset)."""
+    shapes), or the legacy static rectangle when not -- the static rectangle
+    is computed once before the loop (it is invariant across the window),
+    while the lights union is genuinely recomputed per frame since the
+    lights move (see _static_region_mask / _lights_mask_at_offset)."""
     frame_height, frame_width = frames[0].shape[:2]
     out = [frame.copy() for frame in frames]
+    static_mask = None if window.lights else _static_region_mask(window, frame_height, frame_width)
     for i in range(window.start_frame, window.end_frame + 1):
         offset = i - window.start_frame
         gain = gain_bright if _is_pulse_frame(offset, window.period_frames) else gain_dark
-        mask = _region_mask_at_offset(window, frame_height, frame_width, offset)
+        mask = static_mask if static_mask is not None else _lights_mask_at_offset(window, frame_height, frame_width, offset)
         region = out[i][mask, :]
         linear = _srgb_to_linear(region)
         out[i][mask, :] = _linear_to_srgb(linear * gain)
@@ -165,7 +178,7 @@ def inject_red_flash_realistic(
     red_gains: tuple[float, float, float] = (20.0, 0.02, 0.02),
     baseline_gains: tuple[float, float, float] = (0.3, 1.0, 1.0),
 ) -> list[np.ndarray]:
-    """Alternates the masked region between two per-channel gain triples in
+    """Alternates the injected region between two per-channel gain triples in
     linear light space -- red_gains boosts R and suppresses G/B, baseline_gains
     suppresses R -- instead of inject_red_flash's flat saturated-color
     overwrite. Both states are deliberately engineered (neither is a pass-
@@ -176,13 +189,17 @@ def inject_red_flash_realistic(
     sRGB space, which compresses a 10x linear channel-ratio difference down
     to roughly 2.6x -- verified empirically (see plan/spec). The injected
     region is window.lights's per-frame union when set (moving shapes), or
-    the legacy static rectangle when not (see _region_mask_at_offset)."""
+    the legacy static rectangle when not -- the static rectangle is computed
+    once before the loop (it is invariant across the window), while the
+    lights union is genuinely recomputed per frame since the lights move
+    (see _static_region_mask / _lights_mask_at_offset)."""
     frame_height, frame_width = frames[0].shape[:2]
     out = [frame.copy() for frame in frames]
+    static_mask = None if window.lights else _static_region_mask(window, frame_height, frame_width)
     for i in range(window.start_frame, window.end_frame + 1):
         offset = i - window.start_frame
         gains = red_gains if _is_pulse_frame(offset, window.period_frames) else baseline_gains
-        mask = _region_mask_at_offset(window, frame_height, frame_width, offset)
+        mask = static_mask if static_mask is not None else _lights_mask_at_offset(window, frame_height, frame_width, offset)
         region = out[i][mask, :]
         linear = _srgb_to_linear(region)
         modulated = linear * np.array(gains, dtype=np.float32)
