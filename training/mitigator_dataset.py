@@ -26,7 +26,7 @@ import torch
 from torch.utils.data import Dataset
 
 from detector.profiles import ThresholdProfile
-from prior.compute import FramePrior, compute_prior
+from prior.compute import DEFAULT_N_BINS, FramePrior, compute_prior
 
 _TRAIN_PCT = 80
 
@@ -50,7 +50,7 @@ def _read_frame_sequence(frames_dir: Path) -> list[np.ndarray]:
 
 def _save_prior_cache(cache_path: Path, priors: list[FramePrior]) -> None:
     n = len(priors)
-    n_bins = next((p.target_histogram.shape[0] for p in priors if p.target_histogram is not None), 64)
+    n_bins = next((p.target_histogram.shape[0] for p in priors if p.target_histogram is not None), DEFAULT_N_BINS)
     has_target = np.array([p.target_histogram is not None for p in priors], dtype=bool)
     histograms = np.zeros((n, n_bins), dtype=np.float32)
     for i, p in enumerate(priors):
@@ -68,11 +68,11 @@ def _save_prior_cache(cache_path: Path, priors: list[FramePrior]) -> None:
 
 
 def _load_prior_cache(cache_path: Path) -> list[FramePrior]:
-    data = np.load(cache_path)
-    frame_indices = data["frame_indices"]
-    histograms = data["histograms"]
-    has_target = data["has_target"]
-    masks = data["masks"]
+    with np.load(cache_path) as data:
+        frame_indices = data["frame_indices"]
+        histograms = data["histograms"]
+        has_target = data["has_target"]
+        masks = data["masks"]
     priors = []
     for i in range(len(frame_indices)):
         target = histograms[i] if has_target[i] else None
@@ -101,8 +101,28 @@ class MitigatorDataset(Dataset):
         if split not in ("train", "val"):
             raise ValueError(f"split must be 'train' or 'val', got {split!r}")
         self.data_dir = Path(data_dir)
+        # Only the FramePrior objects __getitem__ actually reads (the risky,
+        # has-target center frames that landed in self._index) are retained
+        # here -- each FramePrior carries a full-resolution per-pixel mask,
+        # and most of a sample's frames never end up in self._index (see
+        # samples_scanned/samples_contributing below), so keeping every
+        # frame's FramePrior around for the dataset's lifetime wastes a lot
+        # of memory for data that is never read.
         self._priors_by_sample: dict[Path, dict[int, FramePrior]] = {}
+        # Frame count per sample, tracked separately from
+        # _priors_by_sample so __getitem__'s clip-boundary clamp
+        # (max/min against the last frame index) doesn't require keeping
+        # every frame's FramePrior alive.
+        self._frame_counts: dict[Path, int] = {}
         self._index: list[tuple[Path, int]] = []
+        # samples_scanned: every sample_dir in this split with a meta.json.
+        # samples_contributing: the subset of those that yielded at least
+        # one training example. The gap between the two is normally large
+        # (see docs/superpowers/specs/2026-08-03-mitigator-design.md §8) --
+        # exposing both here lets a caller (e.g. train_mitigator.main)
+        # surface that instead of it being a silent aggregate.
+        self.samples_scanned = 0
+        self.samples_contributing = 0
 
         for sample_dir in sorted(self.data_dir.iterdir()):
             meta_path = sample_dir / "meta.json"
@@ -112,25 +132,41 @@ class MitigatorDataset(Dataset):
             if clip_split(meta["clip_id"]) != split:
                 continue
 
-            priors = _load_or_compute_prior(sample_dir, meta["fps"], profile)
-            self._priors_by_sample[sample_dir] = {p.frame_index: p for p in priors}
+            self.samples_scanned += 1
+            try:
+                fps = meta["fps"]
+            except KeyError as exc:
+                raise KeyError(
+                    f"{sample_dir}: meta.json has no 'fps' field -- this sample "
+                    "predates the fps field being written to meta.json. "
+                    "Regenerate it with the current training.dataset_writer / "
+                    "training.cli."
+                ) from exc
+
+            priors = _load_or_compute_prior(sample_dir, fps, profile)
+            self._frame_counts[sample_dir] = len(priors)
 
             risky_indices: set[int] = set()
             for segment in meta["segments"]:
                 risky_indices.update(range(segment["start_frame"], segment["end_frame"] + 1))
 
+            sample_priors: dict[int, FramePrior] = {}
             for prior in priors:
                 if prior.frame_index in risky_indices and prior.target_histogram is not None:
                     self._index.append((sample_dir, prior.frame_index))
+                    sample_priors[prior.frame_index] = prior
+
+            if sample_priors:
+                self._priors_by_sample[sample_dir] = sample_priors
+                self.samples_contributing += 1
 
     def __len__(self) -> int:
         return len(self._index)
 
     def __getitem__(self, idx: int) -> dict:
         sample_dir, frame_index = self._index[idx]
-        priors = self._priors_by_sample[sample_dir]
-        prior = priors[frame_index]
-        n_frames = len(priors)
+        prior = self._priors_by_sample[sample_dir][frame_index]
+        n_frames = self._frame_counts[sample_dir]
 
         prev_idx = max(0, frame_index - 1)
         next_idx = min(n_frames - 1, frame_index + 1)

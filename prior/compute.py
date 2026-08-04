@@ -18,6 +18,12 @@ from detector.pipeline import run_detection_with_masks
 from detector.profiles import ThresholdProfile
 from prior.histogram import TargetHistogramSmoother, compute_illumination_histogram
 
+# Canonical histogram bin count -- PriorCalc owns histogram computation, so
+# other modules that need this number (e.g. Mitigator's histogram-embedding
+# input width) should import it from here rather than hardcoding a
+# duplicate literal that can silently drift out of sync.
+DEFAULT_N_BINS = 64
+
 
 @dataclass
 class FramePrior:
@@ -47,7 +53,7 @@ def compute_prior(
     frames: Iterable[np.ndarray],
     fps: float,
     profile: ThresholdProfile,
-    n_bins: int = 64,
+    n_bins: int = DEFAULT_N_BINS,
 ) -> list[FramePrior]:
     # Materialise first: unlike run_detection*, compute_prior needs `frames`
     # twice (once for detection, once to re-derive each frame's histogram).

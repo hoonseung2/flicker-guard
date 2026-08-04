@@ -81,7 +81,6 @@ def test_getitem_duplicates_boundary_frame_at_clip_end(tmp_path):
                        segments=[{"start_frame": 12, "end_frame": 19}])
     split = clip_split("clipD")
     dataset = MitigatorDataset(tmp_path, PROFILE, split=split)
-    last_examples = [ex for ex in dataset if True]
     # find the example for frame_index 19 by checking dataset._index directly
     frame_indices = [idx for _, idx in dataset._index]
     assert 19 in frame_indices
@@ -90,6 +89,41 @@ def test_getitem_duplicates_boundary_frame_at_clip_end(tmp_path):
     center = example["window"][3:6, :, :]
     next_frame = example["window"][6:9, :, :]
     assert torch.equal(center, next_frame)
+
+
+def test_dataset_only_retains_frame_priors_for_indexed_frames(tmp_path):
+    # Only ~10% of a real dataset's frames land in self._index (risky +
+    # has-target), so retaining every frame's FramePrior (each carrying a
+    # full-resolution mask) for the dataset's lifetime wastes most of the
+    # memory it holds. Retained priors must match self._index exactly.
+    _write_fake_sample(tmp_path, "clipG", n_frames=20, h=8, w=8, fps=10.0,
+                       segments=[{"start_frame": 12, "end_frame": 15}])
+    split = clip_split("clipG")
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=split)
+    sample_dir = tmp_path / "clipG__test__general__000"
+
+    retained_indices = set(dataset._priors_by_sample[sample_dir].keys())
+    indexed_indices = {idx for d, idx in dataset._index if d == sample_dir}
+    assert retained_indices == indexed_indices
+    assert retained_indices < set(range(20))
+
+
+def test_dataset_tracks_samples_scanned_and_contributing(tmp_path):
+    # clipH contributes no examples (no segments); clipI contributes some.
+    # Both scenarios must be reflected separately, not just aggregated away
+    # into len(dataset).
+    _write_fake_sample(tmp_path, "clipH", n_frames=20, fps=10.0, segments=[])
+    _write_fake_sample(tmp_path, "clipI", n_frames=20, fps=10.0,
+                       segments=[{"start_frame": 12, "end_frame": 15}])
+
+    for split in ("train", "val"):
+        dataset = MitigatorDataset(tmp_path, PROFILE, split=split)
+        scanned = sum(1 for cid in ("clipH", "clipI") if clip_split(cid) == split)
+        contributing = sum(
+            1 for cid in ("clipI",) if clip_split(cid) == split
+        )
+        assert dataset.samples_scanned == scanned
+        assert dataset.samples_contributing == contributing
 
 
 def test_dataset_excludes_risky_frames_with_none_target_histogram(tmp_path):
@@ -183,3 +217,18 @@ def test_load_prior_cache_reads_each_key_only_once(tmp_path, monkeypatch):
             f"Key '{key}' was accessed {call_counts.get(key, 0)} times, "
             f"expected 1 (indicates per-frame re-fetch bug if > 1)"
         )
+
+
+def test_dataset_raises_clear_error_when_meta_json_has_no_fps(tmp_path):
+    # meta.json written before the fps field existed has no "fps" key --
+    # this must fail with a message naming the sample and telling the user
+    # how to fix it, not a bare KeyError: 'fps'.
+    sample_dir = _write_fake_sample(tmp_path, "clipJ", n_frames=20, fps=10.0,
+                                    segments=[{"start_frame": 12, "end_frame": 15}])
+    meta = json.loads((sample_dir / "meta.json").read_text(encoding="utf-8"))
+    del meta["fps"]
+    (sample_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    split = clip_split("clipJ")
+    with pytest.raises(KeyError, match="fps"):
+        MitigatorDataset(tmp_path, PROFILE, split=split)
