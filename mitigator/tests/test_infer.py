@@ -37,6 +37,40 @@ def test_mitigate_segment_passes_through_frames_with_no_target_histogram():
     assert np.array_equal(result[0], frames[0])
 
 
+def test_mitigate_segment_downscales_large_frames_for_bottleneck_attention(monkeypatch):
+    # Regression test: the bottleneck's self-attention is global over all
+    # H*W positions, so its cost is quadratic in pixel count. Training only
+    # ever exercised it on <=512x512 crops; feeding a real video's native
+    # resolution (e.g. 720x1280) unmodified overwhelmed a T4 GPU's memory in
+    # practice, with no Python traceback. mitigate_segment must downscale
+    # before the model and upscale the result back, rather than passing
+    # large frames through unbounded -- this proves it survives a
+    # resolution above the cap and that pixels strictly outside the mask
+    # come back byte-identical to the input (no interpolation bleed).
+    import mitigator.infer as infer_module
+    from prior.compute import FramePrior
+
+    torch.manual_seed(0)
+    model = MitigatorNet()
+    h, w = 600, 800  # above _MAX_PROCESSING_DIM (512) on both axes
+    frames = _flat_frames(3, h, w)
+    mask = np.zeros((h, w), dtype=bool)
+    mask[100:200, 100:200] = True
+    no_mask = np.zeros((h, w), dtype=bool)
+    fake_priors = [
+        FramePrior(frame_index=0, target_histogram=None, mask=no_mask),
+        FramePrior(frame_index=1, target_histogram=np.full(64, 1.0 / 64, dtype=np.float32), mask=mask),
+        FramePrior(frame_index=2, target_histogram=None, mask=no_mask),
+    ]
+    monkeypatch.setattr(infer_module, "compute_prior", lambda frames, fps, profile: fake_priors)
+
+    result = mitigate_segment(frames, fps=10.0, profile=PROFILE, model=model)
+
+    assert result[1].shape == (h, w, 3)
+    outside_mask = ~mask
+    assert np.array_equal(result[1][outside_mask], frames[1][outside_mask])
+
+
 def test_mitigate_segment_passes_through_frame_on_nan_output(monkeypatch):
     # An untrained or misbehaving model can output NaN/Inf. mitigate_segment
     # must never let that reach the returned frames -- fall back to the

@@ -6,12 +6,23 @@ later roadmap step (see docs/superpowers/specs/2026-08-03-mitigator-design.md
 section 2). This exists so a trained checkpoint's output can be inspected
 and measured (PSNR/SSIM vs ground truth) during and after training.
 """
+import cv2
 import numpy as np
 import torch
 
 from detector.profiles import ThresholdProfile
 from mitigator.arch import MitigatorNet, mitigate_frame
 from prior.compute import compute_prior
+
+# The bottleneck's self-attention is global over all H*W spatial positions,
+# so its cost is quadratic in pixel count. Training only ever exercised it
+# on <=512x512 crops (training.train_mitigator's --patch-size); feeding a
+# real video's full native resolution (e.g. 720x1280, ~3.5x the pixels of a
+# 512x512 crop, ~12x the attention-matrix size) blew past a T4's VRAM and
+# crashed with no Python traceback. Cap the longer side at the training
+# patch size so inference never asks the attention layer to run outside the
+# regime it was trained and validated on.
+_MAX_PROCESSING_DIM = 512
 
 
 def mitigate_segment(
@@ -48,16 +59,48 @@ def mitigate_segment(
                 i = prior.frame_index
                 prev_idx = max(0, i - 1)
                 next_idx = min(n - 1, i + 1)
-                window_np = np.concatenate([frames[prev_idx], frames[i], frames[next_idx]], axis=-1)
 
-                window = torch.from_numpy(window_np.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
-                mask = torch.from_numpy(prior.mask[None, None, :, :].astype(np.float32)).to(device)
+                orig_h, orig_w = frames[i].shape[:2]
+                scale = min(1.0, _MAX_PROCESSING_DIM / max(orig_h, orig_w))
+                if scale < 1.0:
+                    proc_w, proc_h = round(orig_w * scale), round(orig_h * scale)
+                    # cv2.resize rejects >4 channels, so resize each frame
+                    # individually (3 channels each) before concatenating
+                    # into the 9-channel window the model expects.
+                    window_proc = np.concatenate(
+                        [
+                            cv2.resize(frames[prev_idx], (proc_w, proc_h), interpolation=cv2.INTER_AREA),
+                            cv2.resize(frames[i], (proc_w, proc_h), interpolation=cv2.INTER_AREA),
+                            cv2.resize(frames[next_idx], (proc_w, proc_h), interpolation=cv2.INTER_AREA),
+                        ],
+                        axis=-1,
+                    )
+                    mask_proc = cv2.resize(
+                        prior.mask.astype(np.float32), (proc_w, proc_h), interpolation=cv2.INTER_AREA
+                    )
+                else:
+                    window_proc = np.concatenate([frames[prev_idx], frames[i], frames[next_idx]], axis=-1)
+                    mask_proc = prior.mask.astype(np.float32)
+
+                window = torch.from_numpy(window_proc.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
+                mask = torch.from_numpy(mask_proc[None, None, :, :]).to(device)
                 histogram = torch.from_numpy(prior.target_histogram).float().unsqueeze(0).to(device)
 
                 restored = mitigate_frame(window, mask, histogram, model)
                 if not torch.isfinite(restored).all():
                     continue  # NaN/Inf from the model -- keep the original frame, never propagate garbage
                 restored_frame = restored.squeeze(0).permute(1, 2, 0).cpu().numpy()
+
+                if scale < 1.0:
+                    restored_frame = cv2.resize(restored_frame, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+                    # Re-blend against the ORIGINAL full-resolution mask/center
+                    # rather than trusting the upsampled result at the mask
+                    # boundary -- interpolation can smear corrected pixels a
+                    # little outside the mask, and pixels outside the mask
+                    # must remain exactly the original input, unconditionally.
+                    full_mask = prior.mask.astype(np.float32)[:, :, None]
+                    restored_frame = full_mask * restored_frame + (1 - full_mask) * frames[i]
+
                 output[i] = np.clip(restored_frame, 0.0, 1.0)
                 corrected_count += 1
                 print(f"mitigate_segment: corrected frame {i}/{n} ({corrected_count}/{to_correct})...")
