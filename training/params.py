@@ -20,11 +20,12 @@ threshold — whose only symptom would be every synthesis attempt exhausting
 its retries with no diagnostic. `_require_exceeds` turns that into an
 immediate, legible configuration error instead.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from detector.profiles import ThresholdProfile
+from training import mask_shapes
 
 _AREA_MARGIN = 0.10
 _MAX_AREA_RATIO = 0.90
@@ -42,6 +43,21 @@ class ClipTooShortError(ValueError):
 
 
 @dataclass
+class LightShape:
+    kind: str  # "rect" | "circle" | "beam"
+    start_row: float
+    start_col: float
+    end_row: float
+    end_col: float
+    half_height: int | None = None    # rect only
+    half_width: int | None = None     # rect only
+    radius: int | None = None         # circle only
+    half_length: int | None = None    # beam only
+    half_thickness: int | None = None  # beam only
+    angle_degrees: float | None = None  # beam only
+
+
+@dataclass
 class InjectionWindow:
     start_frame: int
     end_frame: int  # inclusive
@@ -51,6 +67,11 @@ class InjectionWindow:
     mask_width: int
     period_frames: int  # frames per alternation half-cycle (state held this long)
     ramp_frames: int  # Detector's trailing-window length (round(fps)) at sample time
+    # Populated only by sample_synthesis_params_realistic (Task 5) -- empty
+    # for the flat-mode path and any window built by plain
+    # sample_synthesis_params, which keeps using the mask_top/left/height/
+    # width rectangle above via injection.py's fallback path.
+    lights: list[LightShape] = field(default_factory=list)
 
 
 @dataclass
@@ -192,3 +213,92 @@ def sample_synthesis_params(
     red_rgb = (r, gb_sum / 2, gb_sum / 2)
     baseline_rgb = (0.3, 0.3, 0.3)
     return SynthParams(pattern="red", window=window, red_rgb=red_rgb, baseline_rgb=baseline_rgb)
+
+
+_LIGHT_KINDS = ("rect", "circle", "beam")
+_MAX_LIGHTS = 3
+_BEAM_ASPECT = 4  # half_length = _BEAM_ASPECT * half_thickness
+# Deriving a shape's half-extent/radius from a target area via round() can
+# overshoot the target by several percent per light (squaring amplifies the
+# rounding error), and summing that overshoot across up to _MAX_LIGHTS lights
+# compounds it further -- empirically, two rect lights each targeting 4500px^2
+# out of a 10000px^2 frame achieved a combined 9522px^2 (95.2%), which would
+# have silently defeated _require_exceeds for a profile whose max_area_ratio
+# sits at 0.95 (right where _MAX_AREA_RATIO would otherwise cap it). Capping
+# the combined *lights* target well below _MAX_AREA_RATIO leaves enough
+# headroom to absorb that per-light overshoot; the legacy single-rectangle
+# path (_mask_dims) is unaffected and keeps using _MAX_AREA_RATIO directly.
+_MAX_LIGHTS_AREA_RATIO = 0.60
+
+
+def _light_area(light: LightShape) -> int:
+    if light.kind == "rect":
+        return mask_shapes.rect_area(light.half_height, light.half_width)
+    if light.kind == "circle":
+        return mask_shapes.circle_area(light.radius)
+    return mask_shapes.beam_area(light.half_length, light.half_thickness)
+
+
+def _sample_one_light(
+    kind: str,
+    target_area: float,
+    frame_height: int,
+    frame_width: int,
+    rng: np.random.Generator,
+) -> LightShape:
+    start_row, start_col = float(rng.uniform(0, frame_height)), float(rng.uniform(0, frame_width))
+    end_row, end_col = float(rng.uniform(0, frame_height)), float(rng.uniform(0, frame_width))
+    max_half = max(1, min(frame_height, frame_width) // 2)
+
+    if kind == "rect":
+        half = max(1, min(round((target_area ** 0.5) / 2), max_half))
+        return LightShape(
+            kind="rect", start_row=start_row, start_col=start_col,
+            end_row=end_row, end_col=end_col, half_height=half, half_width=half,
+        )
+    if kind == "circle":
+        radius = max(1, min(round((target_area / np.pi) ** 0.5), max_half))
+        return LightShape(
+            kind="circle", start_row=start_row, start_col=start_col,
+            end_row=end_row, end_col=end_col, radius=radius,
+        )
+    half_thickness = max(1, min(round((target_area / (2 * _BEAM_ASPECT)) ** 0.5), max_half))
+    half_length = max(1, min(_BEAM_ASPECT * half_thickness, max(frame_height, frame_width) // 2))
+    angle_degrees = float(rng.uniform(0, 180))
+    return LightShape(
+        kind="beam", start_row=start_row, start_col=start_col,
+        end_row=end_row, end_col=end_col, half_length=half_length,
+        half_thickness=half_thickness, angle_degrees=angle_degrees,
+    )
+
+
+def sample_lights(
+    profile: ThresholdProfile,
+    frame_height: int,
+    frame_width: int,
+    rng: np.random.Generator,
+) -> list[LightShape]:
+    n_lights = int(rng.integers(1, _MAX_LIGHTS + 1))
+    target_total_area = min(
+        (profile.max_area_ratio + _AREA_MARGIN) * frame_height * frame_width,
+        _MAX_LIGHTS_AREA_RATIO * frame_height * frame_width,
+    )
+    per_light_area = target_total_area / n_lights
+
+    lights = [
+        _sample_one_light(
+            _LIGHT_KINDS[int(rng.integers(0, len(_LIGHT_KINDS)))],
+            per_light_area, frame_height, frame_width, rng,
+        )
+        for _ in range(n_lights)
+    ]
+
+    achieved_area_ratio = sum(_light_area(light) for light in lights) / (frame_height * frame_width)
+    _require_exceeds(
+        achieved_area_ratio, profile.max_area_ratio, profile.name,
+        "max_area_ratio", "combined injected light area ratio",
+        f"light sizes are derived from an equal per-light share of "
+        f"{_MAX_LIGHTS_AREA_RATIO:.2f} of the frame (_MAX_LIGHTS_AREA_RATIO) "
+        f"and rounded to whole pixels on {frame_height}x{frame_width}",
+    )
+    return lights

@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 
 from detector.profiles import ThresholdProfile, load_profile
-from training.params import ClipTooShortError, sample_synthesis_params
+from training import mask_shapes
+from training.params import ClipTooShortError, LightShape, sample_lights, sample_synthesis_params
 
 PROFILE = ThresholdProfile(
     name="test", max_flashes_per_second=3, max_area_ratio=0.10,
@@ -157,3 +158,51 @@ def test_sample_synthesis_params_squeezes_start_to_latest_when_clip_too_short_fo
         )
         assert params.window.start_frame == 4
         assert params.window.end_frame == 4 + 36 - 1
+
+
+def test_sample_lights_returns_one_to_three_lights():
+    rng = np.random.default_rng(0)
+    counts = {len(sample_lights(PROFILE, 100, 100, rng)) for _ in range(30)}
+    assert counts <= {1, 2, 3}
+    assert counts  # at least one draw happened
+
+
+def test_sample_lights_kinds_are_valid():
+    rng = np.random.default_rng(0)
+    for _ in range(10):
+        for light in sample_lights(PROFILE, 100, 100, rng):
+            assert light.kind in ("rect", "circle", "beam")
+
+
+def test_sample_lights_combined_area_exceeds_profile_ratio():
+    def area_of(light):
+        if light.kind == "rect":
+            return mask_shapes.rect_area(light.half_height, light.half_width)
+        if light.kind == "circle":
+            return mask_shapes.circle_area(light.radius)
+        return mask_shapes.beam_area(light.half_length, light.half_thickness)
+
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        lights = sample_lights(PROFILE, 100, 100, rng)
+        total_area = sum(area_of(light) for light in lights)
+        assert total_area / (100 * 100) > PROFILE.max_area_ratio
+
+
+def test_sample_lights_positions_are_within_frame_bounds():
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        for light in sample_lights(PROFILE, 80, 60, rng):
+            assert 0 <= light.start_row <= 80 and 0 <= light.end_row <= 80
+            assert 0 <= light.start_col <= 60 and 0 <= light.end_col <= 60
+
+
+def test_sample_lights_rejects_profile_whose_area_target_is_unreachable():
+    profile = ThresholdProfile(
+        name="area-cliff", max_flashes_per_second=3, max_area_ratio=0.95,
+        general_flash_dark_threshold=0.80, general_flash_delta_threshold=0.10,
+        red_saturation_ratio_threshold=0.80,
+    )
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="area-cliff"):
+        sample_lights(profile, 100, 100, rng)
