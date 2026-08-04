@@ -69,13 +69,17 @@ def _save_prior_cache(cache_path: Path, priors: list[FramePrior]) -> None:
 
 def _load_prior_cache(cache_path: Path) -> list[FramePrior]:
     data = np.load(cache_path)
+    frame_indices = data["frame_indices"]
+    histograms = data["histograms"]
+    has_target = data["has_target"]
+    masks = data["masks"]
     priors = []
-    for i in range(len(data["frame_indices"])):
-        target = data["histograms"][i] if data["has_target"][i] else None
+    for i in range(len(frame_indices)):
+        target = histograms[i] if has_target[i] else None
         priors.append(FramePrior(
-            frame_index=int(data["frame_indices"][i]),
+            frame_index=int(frame_indices[i]),
             target_histogram=target,
-            mask=data["masks"][i],
+            mask=masks[i],
         ))
     return priors
 

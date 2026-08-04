@@ -124,3 +124,62 @@ def test_prior_cache_is_written_and_reused(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mitigator_dataset_module, "compute_prior", _fail_if_called)
     MitigatorDataset(tmp_path, PROFILE, split=split)  # must not raise
+
+
+def test_load_prior_cache_reads_each_key_only_once(tmp_path, monkeypatch):
+    # Regression test for NPZ re-decompression bug: _load_prior_cache should
+    # materialize each .npz key exactly once before the loop, not re-fetch
+    # (and re-decompress) it once per frame.
+    from training.mitigator_dataset import (
+        _load_prior_cache, _save_prior_cache, FramePrior
+    )
+
+    # Create a small synthetic cache with 5 frames to make per-frame bugs obvious
+    sample_dir = tmp_path / "test_sample"
+    sample_dir.mkdir()
+    cache_path = sample_dir / "prior_cache.npz"
+
+    priors = [
+        FramePrior(
+            frame_index=i,
+            target_histogram=np.random.rand(64).astype(np.float32),
+            mask=np.ones((8, 8), dtype=bool),
+        )
+        for i in range(5)
+    ]
+    _save_prior_cache(cache_path, priors)
+
+    # Monkeypatch np.load to wrap the NpzFile and count __getitem__ calls per key
+    import training.mitigator_dataset as mitigator_dataset_module
+
+    call_counts = {}
+    original_load = np.load
+
+    class CountingNpzFile:
+        def __init__(self, npz_file):
+            self._npz = npz_file
+
+        def __getitem__(self, key):
+            call_counts[key] = call_counts.get(key, 0) + 1
+            return self._npz[key]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self._npz.__exit__(*args)
+
+    def patched_load(path, *args, **kwargs):
+        return CountingNpzFile(original_load(path, *args, **kwargs))
+
+    monkeypatch.setattr(mitigator_dataset_module.np, "load", patched_load)
+
+    # Call _load_prior_cache and verify each key was accessed exactly once
+    result = _load_prior_cache(cache_path)
+
+    assert len(result) == 5
+    for key in ["frame_indices", "histograms", "has_target", "masks"]:
+        assert call_counts.get(key) == 1, (
+            f"Key '{key}' was accessed {call_counts.get(key, 0)} times, "
+            f"expected 1 (indicates per-frame re-fetch bug if > 1)"
+        )
