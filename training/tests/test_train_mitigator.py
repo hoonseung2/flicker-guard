@@ -132,11 +132,19 @@ def test_patch_collate_fn_applies_same_offset_to_window_mask_clean():
     torch.manual_seed(42)
     collate_fn = _make_patch_collate_fn(patch_size=8)
 
-    # Create a batch with one example where we can verify the crop is consistent
-    # window has a clear pattern: put a value at a known location
-    window = torch.arange(9 * 16 * 16, dtype=torch.float32).reshape(9, 16, 16)
-    mask = torch.arange(1 * 16 * 16, dtype=torch.float32).reshape(1, 16, 16)
-    clean = torch.arange(3 * 16 * 16, dtype=torch.float32).reshape(3, 16, 16)
+    # Create position-encoded tensors: each spatial location (i,j) has value i*16 + j
+    # This lets us infer the crop offset by reading back the first value
+    def make_position_encoded(shape):
+        c, h, w = shape
+        tensor = torch.zeros(c, h, w)
+        for i in range(h):
+            for j in range(w):
+                tensor[:, i, j] = i * w + j
+        return tensor
+
+    window = make_position_encoded((9, 16, 16))
+    mask = make_position_encoded((1, 16, 16))
+    clean = make_position_encoded((3, 16, 16))
 
     batch = [
         {
@@ -154,15 +162,23 @@ def test_patch_collate_fn_applies_same_offset_to_window_mask_clean():
     cropped_mask = collated["mask"][0]      # (1, 8, 8)
     cropped_clean = collated["clean"][0]    # (3, 8, 8)
 
-    # All should have the same spatial dimensions (8, 8)
-    assert cropped_window.shape[1:] == (8, 8)
-    assert cropped_mask.shape[1:] == (8, 8)
-    assert cropped_clean.shape[1:] == (8, 8)
+    # Infer crop offset from the first value in each cropped tensor
+    # Position (i,j) was encoded as i*16 + j, so top=val//16, left=val%16
+    def infer_offset(cropped_tensor):
+        first_val = cropped_tensor[0, 0, 0].item()
+        top = int(first_val // 16)
+        left = int(first_val % 16)
+        return top, left
 
-    # Since we used arange with different offsets, the relative positions should
-    # be preserved. For example, if window[0, 0, 0] and mask[0, 0, 0] are at
-    # the same crop offset, their values should match the arange pattern.
-    # This is a weak check but confirms they're cropped consistently.
+    window_offset = infer_offset(cropped_window)
+    mask_offset = infer_offset(cropped_mask)
+    clean_offset = infer_offset(cropped_clean)
+
+    # All three must have been cropped with the exact same offset
+    assert window_offset == mask_offset, \
+        f"window offset {window_offset} != mask offset {mask_offset}"
+    assert window_offset == clean_offset, \
+        f"window offset {window_offset} != clean offset {clean_offset}"
 
 
 def test_patch_collate_fn_clamps_to_actual_size_for_small_frames():

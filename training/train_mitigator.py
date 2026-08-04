@@ -89,49 +89,46 @@ def evaluate(model: MitigatorNet, dataloader: DataLoader, device: str) -> dict:
 def _make_patch_collate_fn(patch_size: int):
     """Creates a collate function that randomly crops all spatial tensors to patch_size.
 
-    Crops window, mask, and clean with the same random offset to keep them aligned.
-    Leaves histogram (non-spatial) untouched. Clamps crop size to actual H/W if smaller.
+    Window, mask, and clean are cropped with the same random offset to preserve their
+    spatial alignment in the training pair (misaligned crops would produce invalid labels).
+    Histogram (non-spatial vector) is left untouched. Crop size clamps to actual H/W if smaller.
     """
-    def collate_fn(batch):
-        # First, use default collate to stack tensors
-        batch = default_collate(batch)
+    if patch_size <= 0:
+        raise ValueError(f"patch_size must be positive, got {patch_size}")
 
-        # Extract spatial tensors (batch_size, C, H, W)
-        window = batch["window"]  # (B, 9, H, W)
-        mask = batch["mask"]      # (B, 1, H, W)
-        clean = batch["clean"]    # (B, 3, H, W)
-        histogram = batch["histogram"]  # (B, 64) - non-spatial, don't crop
+    def collate_fn(batch_list):
+        batch_dict = default_collate(batch_list)
+
+        window = batch_dict["window"]
+        mask = batch_dict["mask"]
+        clean = batch_dict["clean"]
+        histogram = batch_dict["histogram"]
 
         batch_size, _, h, w = window.shape
-
-        # Clamp patch_size to actual dimensions
         crop_h = min(patch_size, h)
         crop_w = min(patch_size, w)
 
-        # For each example in the batch, apply same random crop to all three spatial tensors
         cropped_windows = []
         cropped_masks = []
         cropped_cleans = []
 
         for i in range(batch_size):
-            # Pick one random offset per example
             max_top = max(0, h - crop_h)
             max_left = max(0, w - crop_w)
             top = torch.randint(0, max_top + 1, (1,)).item() if max_top > 0 else 0
             left = torch.randint(0, max_left + 1, (1,)).item() if max_left > 0 else 0
 
-            # Apply same crop to window, mask, and clean
+            # Use same (top, left) offset for window, mask, clean to keep them spatially aligned
             cropped_windows.append(window[i, :, top:top+crop_h, left:left+crop_w])
             cropped_masks.append(mask[i, :, top:top+crop_h, left:left+crop_w])
             cropped_cleans.append(clean[i, :, top:top+crop_h, left:left+crop_w])
 
-        # Stack back into batches
-        batch["window"] = torch.stack(cropped_windows)
-        batch["mask"] = torch.stack(cropped_masks)
-        batch["clean"] = torch.stack(cropped_cleans)
-        batch["histogram"] = histogram  # unchanged
+        batch_dict["window"] = torch.stack(cropped_windows)
+        batch_dict["mask"] = torch.stack(cropped_masks)
+        batch_dict["clean"] = torch.stack(cropped_cleans)
+        batch_dict["histogram"] = histogram
 
-        return batch
+        return batch_dict
 
     return collate_fn
 
