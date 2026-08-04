@@ -20,7 +20,14 @@ def mitigate_segment(
     profile: ThresholdProfile,
     model: MitigatorNet,
 ) -> list[np.ndarray]:
+    # compute_prior (detector scoring + motion compensation) has no internal
+    # progress hooks and runs single-threaded on CPU regardless of the
+    # model's device -- print around it so a slow run doesn't look hung
+    # (this bit us in practice: a 20+ minute run produced zero output until
+    # completion, which read as a stuck process rather than a slow one).
+    print(f"mitigate_segment: computing detection priors for {len(frames)} frames...")
     priors = compute_prior(frames, fps=fps, profile=profile)
+    print("mitigate_segment: priors ready, running model over risky frames...")
     was_training = model.training
     model.eval()
     # Run tensors on whichever device the model's weights already live on --
@@ -30,6 +37,7 @@ def mitigate_segment(
     n = len(frames)
     output = [frame.copy() for frame in frames]
 
+    corrected_count = 0
     try:
         with torch.no_grad():
             for prior in priors:
@@ -50,7 +58,11 @@ def mitigate_segment(
                     continue  # NaN/Inf from the model -- keep the original frame, never propagate garbage
                 restored_frame = restored.squeeze(0).permute(1, 2, 0).cpu().numpy()
                 output[i] = np.clip(restored_frame, 0.0, 1.0)
+                corrected_count += 1
+                if corrected_count % 10 == 0:
+                    print(f"mitigate_segment: corrected {corrected_count} frames (frame index {i}/{n})...")
     finally:
         model.train(was_training)
 
+    print(f"mitigate_segment: done, corrected {corrected_count} of {n} frames.")
     return output
