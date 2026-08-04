@@ -11,6 +11,7 @@ from training.params import (
     _sample_one_light,
     sample_lights,
     sample_synthesis_params,
+    sample_synthesis_params_realistic,
 )
 
 PROFILE = ThresholdProfile(
@@ -223,6 +224,25 @@ def test_sample_lights_rejects_profile_whose_area_target_is_unreachable():
     rng = np.random.default_rng(0)
     with pytest.raises(ValueError, match="area-cliff"):
         sample_lights(profile, 100, 100, rng)
+
+
+def test_sample_synthesis_params_realistic_populates_lights():
+    rng = np.random.default_rng(0)
+    params = sample_synthesis_params_realistic(
+        PROFILE, "general", clip_frame_count=200, frame_height=100, frame_width=100, fps=24.0, rng=rng
+    )
+    assert 1 <= len(params.window.lights) <= 3
+
+
+def test_sample_synthesis_params_realistic_keeps_the_same_placement_and_timing_logic():
+    # Same runway relaxation as plain sample_synthesis_params (Task 1) --
+    # this wrapper must not re-derive start_frame/end_frame independently.
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        params = sample_synthesis_params_realistic(
+            PROFILE, "general", clip_frame_count=200, frame_height=100, frame_width=100, fps=24.0, rng=rng
+        )
+        assert params.window.start_frame >= 48
 
 
 def test_sample_one_light_area_overshoot_is_bounded_for_every_kind():

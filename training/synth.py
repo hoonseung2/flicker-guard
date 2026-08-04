@@ -16,7 +16,7 @@ from training.injection import (
     inject_red_flash,
     inject_red_flash_realistic,
 )
-from training.params import InjectionWindow, SynthParams, sample_synthesis_params
+from training.params import InjectionWindow, SynthParams, sample_synthesis_params, sample_synthesis_params_realistic
 
 
 @dataclass
@@ -99,7 +99,7 @@ def synthesize_sample_realistic(
     frame_height, frame_width = clean_frames[0].shape[:2]
 
     for _ in range(max_retries):
-        params = sample_synthesis_params(
+        params = sample_synthesis_params_realistic(
             profile, pattern, len(clean_frames), frame_height, frame_width, fps, rng
         )
         degraded_frames = _apply_pattern_realistic(clean_frames, params)

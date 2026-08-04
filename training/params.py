@@ -302,3 +302,23 @@ def sample_lights(
         f"and rounded to whole pixels on {frame_height}x{frame_width}",
     )
     return lights
+
+
+def sample_synthesis_params_realistic(
+    profile: ThresholdProfile,
+    pattern: str,
+    clip_frame_count: int,
+    frame_height: int,
+    frame_width: int,
+    fps: float,
+    rng: np.random.Generator,
+) -> SynthParams:
+    """Same placement/timing as sample_synthesis_params, but replaces the
+    single static rectangle with a set of moving lights (see
+    docs/superpowers/specs/2026-08-04-mask-diversification-design.md) --
+    used only by the realistic injection path (synthesize_sample_realistic).
+    The flat path keeps calling sample_synthesis_params directly, so its
+    single static rectangle is unaffected."""
+    params = sample_synthesis_params(profile, pattern, clip_frame_count, frame_height, frame_width, fps, rng)
+    params.window.lights = sample_lights(profile, frame_height, frame_width, rng)
+    return params

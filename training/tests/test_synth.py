@@ -95,14 +95,22 @@ def test_synthesize_sample_realistic_accepts_red_flash():
 
 def test_synthesize_sample_realistic_preserves_spatial_texture_in_degraded_frames():
     rng = np.random.default_rng(0)
-    sample = synthesize_sample_realistic(_textured_clip(seed=1), fps=30.0, profile=PROFILE, pattern="general", rng=rng)
+    clean = _textured_clip(seed=1)
+    sample = synthesize_sample_realistic(clean, fps=30.0, profile=PROFILE, pattern="general", rng=rng)
     assert sample is not None
     mid_frame_idx = (sample.window.start_frame + sample.window.end_frame) // 2
     degraded = sample.degraded_frames[mid_frame_idx]
-    top, left = sample.window.mask_top, sample.window.mask_left
-    h, w = sample.window.mask_height, sample.window.mask_width
-    region = degraded[top:top + h, left:left + w]
+    original = clean[mid_frame_idx]
+    changed = ~np.isclose(degraded, original).all(axis=-1)
+    assert changed.any(), "expected some pixels to change in the injected frame"
     # the original base frame has per-pixel spatial variation; a flat-color
-    # injection (the old inject_general_flash) would collapse this region to
-    # one constant value with std == 0
-    assert region.std() > 0.01
+    # injection (the old inject_general_flash) would collapse the changed
+    # region to one constant value with std == 0
+    assert degraded[changed].std() > 0.01
+
+
+def test_synthesize_sample_realistic_accepts_general_flash_with_lights():
+    rng = np.random.default_rng(0)
+    sample = synthesize_sample_realistic(_textured_clip(), fps=30.0, profile=PROFILE, pattern="general", rng=rng)
+    assert sample is not None
+    assert 1 <= len(sample.window.lights) <= 3

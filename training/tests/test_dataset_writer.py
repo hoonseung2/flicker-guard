@@ -81,6 +81,25 @@ def test_sample_injection_mode_defaults_to_flat_when_field_absent(tmp_path):
     assert sample_injection_mode(tmp_path, sid) == "flat"
 
 
+def test_write_sample_round_trips_lights_through_meta_json(tmp_path):
+    from training.params import LightShape
+
+    sample = _sample()
+    sample.window.lights = [
+        LightShape(kind="circle", start_row=1.0, start_col=2.0, end_row=3.0, end_col=4.0, radius=2),
+    ]
+    sid = write_sample(sample, tmp_path, clip_id="bear", index=0, injection_mode="realistic", fps=24.0)
+    meta = json.loads((tmp_path / sid / "meta.json").read_text(encoding="utf-8"))
+    lights = meta["injected_window"]["lights"]
+    assert lights == [
+        {
+            "kind": "circle", "start_row": 1.0, "start_col": 2.0, "end_row": 3.0, "end_col": 4.0,
+            "half_height": None, "half_width": None, "radius": 2,
+            "half_length": None, "half_thickness": None, "angle_degrees": None,
+        }
+    ]
+
+
 def test_write_sample_raises_and_writes_no_meta_when_a_frame_write_fails(tmp_path, monkeypatch):
     # cv2.imwrite returns False (it does not raise) on disk-full / permission
     # / path-length failures. If meta.json were still written, sample_exists
