@@ -508,7 +508,7 @@ def _sample_one_light(
             kind="circle", start_row=start_row, start_col=start_col,
             end_row=end_row, end_col=end_col, radius=radius,
         )
-    half_thickness = max(1, min(round((target_area / (2 * _BEAM_ASPECT)) ** 0.5), max_half))
+    half_thickness = max(1, min(round((target_area / (4 * _BEAM_ASPECT)) ** 0.5), max_half))
     half_length = max(1, min(_BEAM_ASPECT * half_thickness, max(frame_height, frame_width) // 2))
     angle_degrees = float(rng.uniform(0, 180))
     return LightShape(
