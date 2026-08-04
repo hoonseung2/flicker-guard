@@ -33,7 +33,7 @@ def test_load_model_restores_saved_weights(tmp_path):
     loaded = load_model(checkpoint_path)
 
     for original_param, loaded_param in zip(model.parameters(), loaded.parameters()):
-        assert torch.equal(original_param, loaded_param)
+        assert torch.equal(original_param, loaded_param.cpu())
 
 
 def test_write_video_round_trips_frame_count_and_resolution(tmp_path):

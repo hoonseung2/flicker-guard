@@ -28,6 +28,8 @@ def load_model(checkpoint_path: Path) -> MitigatorNet:
     model = MitigatorNet()
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model"])
+    if torch.cuda.is_available():
+        model = model.to("cuda")
     return model
 
 

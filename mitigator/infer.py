@@ -23,6 +23,10 @@ def mitigate_segment(
     priors = compute_prior(frames, fps=fps, profile=profile)
     was_training = model.training
     model.eval()
+    # Run tensors on whichever device the model's weights already live on --
+    # mitigate_segment must not silently downgrade a caller's GPU-resident
+    # model to CPU (or vice versa) by hardcoding a device here.
+    device = next(model.parameters()).device
     n = len(frames)
     output = [frame.copy() for frame in frames]
 
@@ -37,14 +41,14 @@ def mitigate_segment(
                 next_idx = min(n - 1, i + 1)
                 window_np = np.concatenate([frames[prev_idx], frames[i], frames[next_idx]], axis=-1)
 
-                window = torch.from_numpy(window_np.transpose(2, 0, 1)).float().unsqueeze(0)
-                mask = torch.from_numpy(prior.mask[None, None, :, :].astype(np.float32))
-                histogram = torch.from_numpy(prior.target_histogram).float().unsqueeze(0)
+                window = torch.from_numpy(window_np.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
+                mask = torch.from_numpy(prior.mask[None, None, :, :].astype(np.float32)).to(device)
+                histogram = torch.from_numpy(prior.target_histogram).float().unsqueeze(0).to(device)
 
                 restored = mitigate_frame(window, mask, histogram, model)
                 if not torch.isfinite(restored).all():
                     continue  # NaN/Inf from the model -- keep the original frame, never propagate garbage
-                restored_frame = restored.squeeze(0).permute(1, 2, 0).numpy()
+                restored_frame = restored.squeeze(0).permute(1, 2, 0).cpu().numpy()
                 output[i] = np.clip(restored_frame, 0.0, 1.0)
     finally:
         model.train(was_training)
