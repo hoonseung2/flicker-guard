@@ -36,10 +36,10 @@ def mitigate_segment(
     # model's device -- print around it so a slow run doesn't look hung
     # (this bit us in practice: a 20+ minute run produced zero output until
     # completion, which read as a stuck process rather than a slow one).
-    print(f"mitigate_segment: computing detection priors for {len(frames)} frames...")
+    print(f"mitigate_segment: computing detection priors for {len(frames)} frames...", flush=True)
     priors = compute_prior(frames, fps=fps, profile=profile)
     to_correct = sum(1 for prior in priors if prior.target_histogram is not None)
-    print(f"mitigate_segment: priors ready, {to_correct} of {len(frames)} frames need correction...")
+    print(f"mitigate_segment: priors ready, {to_correct} of {len(frames)} frames need correction...", flush=True)
     was_training = model.training
     model.eval()
     # Run tensors on whichever device the model's weights already live on --
@@ -103,9 +103,9 @@ def mitigate_segment(
 
                 output[i] = np.clip(restored_frame, 0.0, 1.0)
                 corrected_count += 1
-                print(f"mitigate_segment: corrected frame {i}/{n} ({corrected_count}/{to_correct})...")
+                print(f"mitigate_segment: corrected frame {i}/{n} ({corrected_count}/{to_correct})...", flush=True)
     finally:
         model.train(was_training)
 
-    print(f"mitigate_segment: done, corrected {corrected_count} of {n} frames.")
+    print(f"mitigate_segment: done, corrected {corrected_count} of {n} frames.", flush=True)
     return output
