@@ -217,9 +217,17 @@ def main(argv: list[str] | None = None) -> int:
         val_metrics = evaluate(model, val_loader, device)
         elapsed = time.time() - start_time
 
-        save_checkpoint(latest_path, model, optimizer, epoch, best_val_loss)
-        if val_metrics["loss"] < best_val_loss:
+        # best_val_loss must reflect this epoch's result before latest.pt is
+        # saved, not after -- otherwise latest.pt gets the pre-update (stale,
+        # one-epoch-behind) threshold, and a later --resume from latest.pt
+        # can let a worse-than-true-best epoch pass the < check and clobber
+        # best.pt with an inferior checkpoint.
+        is_new_best = val_metrics["loss"] < best_val_loss
+        if is_new_best:
             best_val_loss = val_metrics["loss"]
+
+        save_checkpoint(latest_path, model, optimizer, epoch, best_val_loss)
+        if is_new_best:
             save_checkpoint(checkpoint_dir / "best.pt", model, optimizer, epoch, best_val_loss)
 
         with open(log_path, "a", encoding="utf-8") as f:

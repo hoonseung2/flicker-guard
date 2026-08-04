@@ -3,7 +3,7 @@ import torch
 
 from mitigator.arch import MitigatorNet
 from training.mitigator_losses import l1_ssim_loss
-from training.train_mitigator import load_checkpoint, save_checkpoint, train_one_epoch, _make_patch_collate_fn
+from training.train_mitigator import load_checkpoint, main, save_checkpoint, train_one_epoch, _make_patch_collate_fn
 
 
 class _FixedBatchDataset(torch.utils.data.Dataset):
@@ -151,6 +151,70 @@ def test_checkpoint_resume_round_trip_keeps_optimizer_state_on_model_device_gpu(
     # The real bug surfaced on the next optimizer.step() after resume, not
     # on load itself -- exercise one more training step to be sure.
     train_one_epoch(new_model, new_optimizer, dataloader, device="cuda")
+
+
+class _FakeMitigatorDataset(torch.utils.data.Dataset):
+    """Stands in for training.mitigator_dataset.MitigatorDataset in main()
+    tests -- avoids needing a real data-dir with synthesized frames/priors
+    on disk just to exercise main()'s checkpoint bookkeeping."""
+
+    def __init__(self, *args, **kwargs):
+        self.window = torch.rand(9, 8, 8)
+        self.mask = torch.ones(1, 8, 8)
+        self.histogram = torch.rand(64)
+        self.clean = torch.rand(3, 8, 8)
+        self.samples_scanned = 1
+        self.samples_contributing = 1
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, idx):
+        return {
+            "window": self.window,
+            "mask": self.mask,
+            "histogram": self.histogram,
+            "clean": self.clean,
+        }
+
+
+def test_main_resume_does_not_clobber_best_pt_with_worse_checkpoint(tmp_path, monkeypatch):
+    # Regression test for the residual best.pt-clobber bug: latest.pt used
+    # to be saved with the PRE-update best_val_loss, so a --resume run
+    # restored a stale, one-epoch-behind threshold. A later epoch that beat
+    # that stale threshold but not the true best would then pass the `<`
+    # check and overwrite best.pt with an inferior checkpoint.
+    import training.train_mitigator as train_mitigator_module
+
+    monkeypatch.setattr(train_mitigator_module, "MitigatorDataset", _FakeMitigatorDataset)
+
+    # epoch0=0.5, epoch1=0.2 (true best), epoch2=0.3 -- worse than the true
+    # best (0.2) but better than the stale threshold (0.5) a buggy resume
+    # would have restored.
+    scripted_losses = iter([0.5, 0.2, 0.3])
+
+    def _fake_evaluate(model, dataloader, device):
+        return {"loss": next(scripted_losses), "psnr": 0.0}
+
+    monkeypatch.setattr(train_mitigator_module, "evaluate", _fake_evaluate)
+
+    checkpoint_dir = tmp_path / "ckpt"
+    common_args = [
+        "--data-dir", str(tmp_path / "data"),
+        "--profile", "configs/profiles/itu.json",
+        "--checkpoint-dir", str(checkpoint_dir),
+        "--batch-size", "4",
+    ]
+
+    main(common_args + ["--epochs", "2"])
+    best_after_run1 = torch.load(checkpoint_dir / "best.pt", map_location="cpu", weights_only=True)
+    assert best_after_run1["epoch"] == 1
+    assert best_after_run1["best_val_loss"] == 0.2
+
+    main(common_args + ["--epochs", "3", "--resume"])
+    best_after_resume = torch.load(checkpoint_dir / "best.pt", map_location="cpu", weights_only=True)
+    assert best_after_resume["epoch"] == 1
+    assert best_after_resume["best_val_loss"] == 0.2
 
 
 def test_train_one_epoch_raises_clearly_on_nan_loss(monkeypatch):
