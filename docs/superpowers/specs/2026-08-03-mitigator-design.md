@@ -120,6 +120,7 @@ Detector·DatasetSynth·PriorCalc와 동일한 스타일: 작은 인메모리 �
 - **데이터 규모**: 170개 샘플(위험 구간만 추리면 실질적으로 더 적음)이 견고한 학습에 충분한지 미지수 — 실제 학습 곡선을 보고 DAVIS 소스 다양화나 증강 여부 판단
 - **general/red 데이터 불균형**: 87(red) vs 83(general), 이미 알려진 값
 - **red-flash 샘플은 학습이 더 어려울 가능성**: `2026-08-03-realistic-injection-design.md` §7에 기록된 대로 red-flash 펄스 프레임은 질감이 거의 남지 않은 flat 포화 상태라, 모델이 참고할 정보가 이웃 프레임과 prior뿐 — 실제 결과를 보고 판단
+- **LFRM 스타일 텍스처 복원 (향후 로드맵)**: BlazeBVD의 LFRM(Local Flicker Removal Module — optical flow로 이웃 프레임에서 과/저노출 영역에 텍스처를 이식)은 이번 설계에 채택하지 않았음(§1, PriorCalc 설계 문서 참고 — Detector의 기존 신호를 재사용하는 쪽을 택함). 다만 바로 위 항목의 red-flash 텍스처 손실 문제는 구조적으로 LFRM이 정확히 겨냥하는 문제라, 실제 학습 결과에서 red-flash 복원 품질이 불충분한 것으로 확인되면 LFRM 스타일의 optical-flow 기반 이웃 프레임 텍스처 이식을 Mitigator에 추가하는 것을 향후 개선안으로 검토. 지금은 채택하지 않음 — 현재 구조(잔차 예측 + 마스크 블렌딩)로 충분한지 실측 후 판단.
 - **하이퍼파라미터(학습률·패치 크기·에폭 수)는 잠정값**: smoke test + 1 epoch 실측 이후 조정 예정
 - **본격적인 프로덕션 학습**: 에폭 대폭 증가·데이터 확장·필요시 클라우드 GPU는 이번 스코프 밖, 로컬 학습 실측 후 판단
 - **WCAG 10도 시야각 서브셋 면적 기준** (README §9): Detector의 기존 한계이며 PriorCalc/Mitigator는 이 gap에 영향받지 않음 (Detector 판정을 그대로 재사용하는 구조라 나중에 개선되면 자동 상속) — 재론 불필요
