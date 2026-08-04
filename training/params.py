@@ -61,6 +61,10 @@ class LightShape:
 class InjectionWindow:
     start_frame: int
     end_frame: int  # inclusive
+    # Fallback static rectangle. Always populated, but when `lights` below is
+    # non-empty these do NOT describe the actual injected region -- the real
+    # injected pixels are lights's per-frame rendered union instead (see
+    # injection.py's _static_region_mask vs _lights_mask_at_offset).
     mask_top: int
     mask_left: int
     mask_height: int
@@ -228,7 +232,40 @@ _BEAM_ASPECT = 4  # half_length = _BEAM_ASPECT * half_thickness
 # the combined *lights* target well below _MAX_AREA_RATIO leaves enough
 # headroom to absorb that per-light overshoot; the legacy single-rectangle
 # path (_mask_dims) is unaffected and keeps using _MAX_AREA_RATIO directly.
+#
+# NOTE on _require_exceeds below (sum(_light_area(...)) vs what actually
+# renders): the analytic area sum is an upper bound on rendered area, not a
+# safety margin / "conservative" floor. Measured on a 480x854 frame across
+# the shipped 0.25-threshold profiles: the analytic sum averaged ratio 0.352
+# while the real rendered union (what synthesize_sample_realistic's Detector
+# re-validation actually sees) averaged only 0.216 -- a ~39% shortfall.
+# Two causes: (a) light centers are fractional/interpolated, so
+# rect_area/beam_area's integer-pixel-count formulas overstate what actually
+# renders (e.g. rect(half=5): analytic 121px vs rendered ~100px); (b)
+# _sample_one_light draws centers uniformly across the *whole* frame, so a
+# shape centered near a corner can lose most of its area to off-frame
+# clipping when rendered. No shipped profile is affected (Detector uses a
+# rolling-max area test across a window, not a strict per-frame test; 144/144
+# real acceptance measured across all shipped profiles), but a profile closer
+# to the edge could hit exactly the silent-retry-exhaustion failure mode
+# _require_exceeds exists to prevent.
 _MAX_LIGHTS_AREA_RATIO = 0.60
+# Profiles with max_area_ratio above roughly 0.40-0.45 see a rapidly
+# increasing chance that sample_lights raises a plain ValueError (not
+# ClipTooShortError) because _require_exceeds rejects a per-light area
+# shortfall -- measured (200 draws/point, 480x854 frame): <=0.40 -> 0%,
+# 0.45-0.50 -> ~11.5%, 0.55 -> ~19.5%, 0.60 -> ~33%, >=0.70 -> 100% (not just
+# unlikely -- structurally impossible, since _MAX_LIGHTS_AREA_RATIO itself
+# caps the achievable combined area at/below what a threshold >= ~0.60 would
+# need to exceed). All 6 shipped profiles (0.10-0.25) are comfortably in the
+# 0% range and unaffected. Because this is a plain ValueError, cli.py's batch
+# runner (which only catches ClipTooShortError specifically) does not catch
+# it -- it propagates and aborts the whole batch run, potentially partway
+# through since which draw triggers it is stochastic. Revisit before
+# onboarding any profile near or above max_area_ratio ~0.60; the fix would
+# need a real design decision (retry with a different shape kind, exclude
+# beam from large single-light draws, or redistribute target area across
+# lights) and is out of scope here.
 
 
 def _light_area(light: LightShape) -> int:
@@ -236,7 +273,9 @@ def _light_area(light: LightShape) -> int:
         return mask_shapes.rect_area(light.half_height, light.half_width)
     if light.kind == "circle":
         return mask_shapes.circle_area(light.radius)
-    return mask_shapes.beam_area(light.half_length, light.half_thickness)
+    if light.kind == "beam":
+        return mask_shapes.beam_area(light.half_length, light.half_thickness)
+    raise ValueError(f"unknown light kind: {light.kind!r}")
 
 
 def _sample_one_light(
@@ -263,6 +302,12 @@ def _sample_one_light(
             end_row=end_row, end_col=end_col, radius=radius,
         )
     half_thickness = max(1, min(round((target_area / (4 * _BEAM_ASPECT)) ** 0.5), max_half))
+    # This half_length clamp (and the max_half clamp on half_thickness above)
+    # is the proximate cause of the sample_lights ValueError-rate blowup
+    # documented above _MAX_LIGHTS_AREA_RATIO: for a large single-light
+    # target, clamping half_length to the frame's half-side caps the beam's
+    # achievable area well below its per-light target, so the combined-area
+    # check in sample_lights fails increasingly often as max_area_ratio rises.
     half_length = max(1, min(_BEAM_ASPECT * half_thickness, max(frame_height, frame_width) // 2))
     angle_degrees = float(rng.uniform(0, 180))
     return LightShape(
