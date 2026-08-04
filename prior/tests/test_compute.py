@@ -75,6 +75,29 @@ def test_compute_prior_returns_frame_prior_per_frame_with_matching_indices():
     assert results[0].target_histogram is None  # frame 0 always uncertain, no clean frame seen yet
 
 
+def test_compute_prior_target_is_a_trailing_average_not_the_latest_frame_alone():
+    # Regression test for the hybrid design: target histograms are derived
+    # from each frame's own non-masked pixels (so a continuously-risky clip
+    # never starves), but smoothed over a trailing window (like the old
+    # temporal approach) so the target doesn't jitter frame-to-frame with
+    # whatever the current frame happens to look like.
+    frames = []
+    for i in range(12):
+        value = 0.5 if i % 2 == 0 else 0.55
+        frames.append(np.full((20, 20, 3), value, dtype=np.float32))
+
+    results = compute_prior(frames, fps=4.0, profile=PROFILE)  # window_frames = round(4.0) = 4
+
+    hist_a = compute_illumination_histogram(relative_luminance(frames[10]), n_bins=64)  # value=0.5
+    hist_b = compute_illumination_histogram(relative_luminance(frames[11]), n_bins=64)  # value=0.55
+    expected = np.mean([hist_a, hist_b, hist_a, hist_b], axis=0)  # last 4 contributing frames: 8,9,10,11
+
+    assert np.allclose(results[11].target_histogram, expected, atol=1e-6)
+    # Not just the latest frame's own histogram -- that would mean no
+    # smoothing is happening at all.
+    assert not np.allclose(results[11].target_histogram, hist_b, atol=1e-6)
+
+
 def test_compute_prior_accepts_a_one_shot_generator():
     # detector.cli.read_video_frames returns a generator; compute_prior consumes
     # frames twice, so it must materialise them rather than silently returning [].
