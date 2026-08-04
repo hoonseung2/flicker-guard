@@ -4,3 +4,7 @@ __pycache__/
 
 # Raw and generated datasets — large binary content, never committed.
 data/
+
+# Trained Mitigator checkpoints — large, regenerable binary artifacts.
+mitigator/weights/*
+!mitigator/weights/.gitkeep
