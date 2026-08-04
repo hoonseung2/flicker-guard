@@ -217,6 +217,59 @@ def test_main_resume_does_not_clobber_best_pt_with_worse_checkpoint(tmp_path, mo
     assert best_after_resume["best_val_loss"] == 0.2
 
 
+class _VariableShapeMitigatorDataset(torch.utils.data.Dataset):
+    """Val split stand-in with heterogeneous per-item spatial shapes, like
+    real DAVIS clips of differing native resolution. Regression fixture for
+    the val batch_size=1 fix -- batch_size>1 with collate_fn=None would try
+    to torch.stack these mismatched shapes and raise a RuntimeError."""
+
+    _SHAPES = [(8, 8), (8, 12)]
+
+    def __init__(self, *args, **kwargs):
+        self.samples_scanned = 1
+        self.samples_contributing = 1
+
+    def __len__(self):
+        return len(self._SHAPES)
+
+    def __getitem__(self, idx):
+        h, w = self._SHAPES[idx]
+        return {
+            "window": torch.rand(9, h, w),
+            "mask": torch.ones(1, h, w),
+            "histogram": torch.rand(64),
+            "clean": torch.rand(3, h, w),
+        }
+
+
+def test_main_val_loader_handles_differently_shaped_examples(tmp_path, monkeypatch):
+    # Regression test: real source clips (e.g. DAVIS) don't all share one
+    # resolution, and val is deliberately never cropped -- a val batch size
+    # > 1 with collate_fn=None used to try to torch.stack mismatched shapes
+    # and crash with "stack expects each tensor to be equal size". main()
+    # must hardcode val batch_size=1 to sidestep this.
+    import training.train_mitigator as train_mitigator_module
+
+    def _fake_dataset(data_dir, profile, split):
+        if split == "train":
+            return _FakeMitigatorDataset()
+        return _VariableShapeMitigatorDataset()
+
+    monkeypatch.setattr(train_mitigator_module, "MitigatorDataset", _fake_dataset)
+
+    checkpoint_dir = tmp_path / "ckpt"
+    exit_code = main([
+        "--data-dir", str(tmp_path / "data"),
+        "--profile", "configs/profiles/itu.json",
+        "--checkpoint-dir", str(checkpoint_dir),
+        "--batch-size", "4",
+        "--epochs", "1",
+    ])
+
+    assert exit_code == 0
+    assert (checkpoint_dir / "best.pt").exists()
+
+
 def test_train_one_epoch_raises_clearly_on_nan_loss(monkeypatch):
     # A NaN loss must never be swallowed -- it means something upstream
     # (bad data, exploding lr, etc.) is broken, and silently continuing

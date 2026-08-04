@@ -198,7 +198,14 @@ def main(argv: list[str] | None = None) -> int:
         collate_fn = _make_patch_collate_fn(args.patch_size)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=None)
+    # Real source clips (e.g. DAVIS) don't all share one resolution, and val
+    # is deliberately never cropped (see collate_fn=None above) to avoid
+    # random-crop noise in the best.pt comparison -- so a val batch size > 1
+    # can try to torch.stack differently-shaped frames from different clips
+    # and crash. Validation doesn't need batching for throughput (no
+    # backward pass), so batch_size=1 sidesteps this entirely while keeping
+    # every val example at its real, uncropped resolution.
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=None)
 
     model = MitigatorNet()
     model.to(device)
