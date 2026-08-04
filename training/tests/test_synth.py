@@ -114,3 +114,22 @@ def test_synthesize_sample_realistic_accepts_general_flash_with_lights():
     sample = synthesize_sample_realistic(_textured_clip(), fps=30.0, profile=PROFILE, pattern="general", rng=rng)
     assert sample is not None
     assert 1 <= len(sample.window.lights) <= 3
+
+
+def test_synthesize_sample_realistic_exercises_full_runway_branch_with_lights():
+    # Every other test in this file uses n=90, fps=30.0: duration_frames=42
+    # (window_frames=30, period_frames=3, 30+4*3=42) -> latest_start=90-42=48,
+    # which is below desired_runway=2*window_frames=60, so
+    # sample_synthesis_params always squeezes start_frame to the single
+    # degenerate value 48. That means Task 1's "clip is long enough, pick
+    # anywhere in the runway range" placement branch has never actually run
+    # together with real light sampling (Task 3) and real Detector
+    # re-validation. A 150-frame clip gives latest_start=150-42=108, which is
+    # >= desired_runway=60, so start_frame is drawn from the genuine range
+    # [60, 108] instead of being squeezed -- every draw must land > 48.
+    rng = np.random.default_rng(0)
+    sample = synthesize_sample_realistic(
+        _textured_clip(n=150), fps=30.0, profile=PROFILE, pattern="general", rng=rng
+    )
+    assert sample is not None
+    assert sample.window.start_frame > 48
