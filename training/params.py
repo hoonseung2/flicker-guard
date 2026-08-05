@@ -278,6 +278,59 @@ def _light_area(light: LightShape) -> int:
     raise ValueError(f"unknown light kind: {light.kind!r}")
 
 
+def _achieved_area(kind: str, target_area: float, frame_height: int, frame_width: int) -> int:
+    """Area `_sample_one_light` actually produces for this kind and target.
+
+    Asks `_sample_one_light` directly rather than re-deriving its size
+    formulas, so the two can never drift apart. The generator only
+    positions the shape -- `_light_area` reads the size fields alone -- so
+    the answer is deterministic despite the throwaway rng.
+
+    The result is usually below `target_area`: each branch clamps its size
+    to at most half the frame, and rounding to whole pixels loses more.
+    Measured on 480x854 at a 0.60 target: rect reaches 0.56, beam 0.52,
+    circle only 0.44.
+    """
+    probe = _sample_one_light(kind, target_area, frame_height, frame_width, np.random.default_rng(0))
+    return _light_area(probe)
+
+
+def _feasible_kinds(
+    target_area: float,
+    min_required_area: float,
+    frame_height: int,
+    frame_width: int,
+) -> tuple[str, ...]:
+    """Kinds whose area at `target_area` clears `min_required_area`.
+
+    Note the two different areas. `target_area` is what the shape aims for;
+    `min_required_area` is this light's share of what `sample_lights`'
+    `_require_exceeds` check actually demands (the profile's
+    `max_area_ratio`). Filtering on the target instead of the requirement
+    would be both too strict and too lax: too strict because a shape landing
+    a hair under a generous target is still far above the threshold, and too
+    lax because at a target no shape can reach, every kind gets filtered out
+    and the fallback below hands back the same unfiltered choice that caused
+    the failure.
+
+    Picking uniformly from all kinds regardless was the direct cause of
+    `sample_lights` raising a plain (batch-aborting) ValueError on a
+    measured ~33% of draws at a 0.60 target: shapes clamp to half the frame
+    and lose more to whole-pixel rounding, so on 480x854 at a 0.60 target
+    rect reaches 0.56, beam 0.52, but circle only 0.44 -- a circle drawn for
+    a 0.50-threshold profile simply cannot satisfy the check.
+
+    Falls back to every kind when none qualifies, so a genuinely
+    unsatisfiable profile still surfaces as `_require_exceeds`'s explanatory
+    ValueError rather than an IndexError on an empty tuple.
+    """
+    feasible = tuple(
+        kind for kind in _LIGHT_KINDS
+        if _achieved_area(kind, target_area, frame_height, frame_width) > min_required_area
+    )
+    return feasible or _LIGHT_KINDS
+
+
 def _sample_one_light(
     kind: str,
     target_area: float,
@@ -330,9 +383,14 @@ def sample_lights(
     )
     per_light_area = target_total_area / n_lights
 
+    # Each light must clear its equal share of the profile's threshold, so
+    # that the sum the _require_exceeds check below looks at clears the
+    # whole threshold.
+    min_required_per_light = profile.max_area_ratio * frame_height * frame_width / n_lights
+    kinds = _feasible_kinds(per_light_area, min_required_per_light, frame_height, frame_width)
     lights = [
         _sample_one_light(
-            _LIGHT_KINDS[int(rng.integers(0, len(_LIGHT_KINDS)))],
+            kinds[int(rng.integers(0, len(kinds)))],
             per_light_area, frame_height, frame_width, rng,
         )
         for _ in range(n_lights)

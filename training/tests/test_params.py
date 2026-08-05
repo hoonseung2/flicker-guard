@@ -5,8 +5,11 @@ import pytest
 
 from detector.profiles import ThresholdProfile, load_profile
 from training.params import (
+    _LIGHT_KINDS,
     ClipTooShortError,
     LightShape,
+    _achieved_area,
+    _feasible_kinds,
     _light_area,
     _sample_one_light,
     sample_lights,
@@ -260,3 +263,74 @@ def test_sample_one_light_area_overshoot_is_bounded_for_every_kind():
             light = _sample_one_light(kind, target_area, 1000, 1000, rng)
             overshoot = _light_area(light) / target_area
             assert 0.9 < overshoot < 1.3, f"{kind} at target={target_area}: overshoot={overshoot:.3f}"
+
+
+def test_achieved_area_is_independent_of_the_random_positioning():
+    # _achieved_area probes _sample_one_light with a throwaway generator, so
+    # it is only a valid answer if a light's area depends on its size fields
+    # alone and not on where the generator happened to place it.
+    frame_height, frame_width = 480, 854
+    target = 0.30 * frame_height * frame_width
+
+    for kind in _LIGHT_KINDS:
+        areas = {
+            _light_area(_sample_one_light(kind, target, frame_height, frame_width, np.random.default_rng(seed)))
+            for seed in range(10)
+        }
+        assert len(areas) == 1
+        assert areas.pop() == _achieved_area(kind, target, frame_height, frame_width)
+
+
+def test_feasible_kinds_keeps_every_shape_for_the_shipped_profiles_thresholds():
+    # Shipped profiles sit at 0.10-0.25. Filtering exists for the extreme
+    # end of the area range and must not quietly collapse shape variety in
+    # the ordinary case -- a dataset of nothing but rectangles would undo
+    # the earlier mask-diversification work.
+    frame_height, frame_width = 480, 854
+    frame_area = frame_height * frame_width
+
+    for threshold in (0.10, 0.25):
+        for target_ratio in (threshold + 0.10, 0.60):
+            kinds = _feasible_kinds(
+                target_ratio * frame_area, threshold * frame_area, frame_height, frame_width
+            )
+            assert set(kinds) == set(_LIGHT_KINDS)
+
+
+def test_feasible_kinds_drops_a_shape_that_cannot_clear_a_high_threshold():
+    # Measured on 480x854 at a 0.60 target: rect reaches 0.564 and beam
+    # 0.519, but circle caps at 0.441 -- so against a 0.50 threshold the
+    # circle is exactly the draw that used to raise.
+    frame_height, frame_width = 480, 854
+    frame_area = frame_height * frame_width
+
+    kinds = _feasible_kinds(0.60 * frame_area, 0.50 * frame_area, frame_height, frame_width)
+
+    assert "circle" not in kinds
+    assert "rect" in kinds
+
+
+def test_feasible_kinds_never_returns_empty():
+    # sample_lights picks uniformly from this tuple -- an empty result would
+    # be an IndexError instead of the clear _require_exceeds ValueError that
+    # is supposed to report an unsatisfiable profile.
+    frame_height, frame_width = 480, 854
+    impossible_requirement = float(frame_height * frame_width) * 10
+    assert _feasible_kinds(
+        0.60 * frame_height * frame_width, impossible_requirement, frame_height, frame_width
+    ) != ()
+
+
+def test_sample_lights_does_not_raise_at_a_high_area_threshold():
+    # Regression test: with uniform kind selection this raised ValueError on
+    # roughly a third of draws at a 0.60 target (measured), and because it
+    # is a plain ValueError rather than ClipTooShortError it aborted whole
+    # batch runs rather than skipping one sample.
+    profile = ThresholdProfile(
+        name="wide-area", max_flashes_per_second=3, max_area_ratio=0.50,
+        general_flash_dark_threshold=0.80, general_flash_delta_threshold=0.10,
+        red_saturation_ratio_threshold=0.80,
+    )
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        assert len(sample_lights(profile, 480, 854, rng)) >= 1
