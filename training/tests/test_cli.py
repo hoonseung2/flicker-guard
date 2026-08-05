@@ -350,3 +350,29 @@ def test_run_batch_defaults_to_flat_injection_mode(tmp_path, monkeypatch):
     cli_module.run_batch(clips_dir, profiles_dir, out_dir, samples_per_combo=1)  # no injection_mode passed
 
     assert len(calls) == 2
+
+
+def test_run_batch_records_a_synthesis_valueerror_instead_of_aborting(tmp_path, monkeypatch):
+    # A single unsatisfiable sample must not destroy the rest of a
+    # multi-hour batch run. ClipTooShortError was already handled, but any
+    # other ValueError (e.g. _require_exceeds rejecting a profile) escaped
+    # and aborted everything.
+    import training.cli as cli_module
+
+    calls = {"n": 0}
+
+    def _explode_once(clean_frames, fps, profile, pattern, rng):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("synthetic failure for test")
+        return None
+
+    monkeypatch.setattr(cli_module, "synthesize_sample_realistic", _explode_once)
+    monkeypatch.setattr(cli_module, "synthesize_sample", _explode_once)
+
+    clips_dir, profiles_dir = _standard_inputs(tmp_path)
+
+    summary = run_batch(clips_dir, profiles_dir, tmp_path / "out", samples_per_combo=1, seed=0)
+
+    assert calls["n"] > 1  # kept going past the raising sample
+    assert any(d["reason"] == "synthesis_error" for d in summary["failed_details"])

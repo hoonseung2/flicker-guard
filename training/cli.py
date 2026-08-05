@@ -178,6 +178,17 @@ def run_batch(
                             profile.name, pattern, index, str(exc),
                         )
                         continue
+                    except ValueError as exc:
+                        # ClipTooShortError (a ValueError subclass) is caught
+                        # above; this catches everything else, so one
+                        # unsatisfiable sample is recorded and skipped rather
+                        # than aborting a long run partway through with all
+                        # remaining work lost.
+                        _record_failure(
+                            summary, "synthesis_error", clip_id,
+                            profile.name, pattern, index, str(exc),
+                        )
+                        continue
                     if sample is None:
                         _record_failure(
                             summary, "validation_exhausted", clip_id,
