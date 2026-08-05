@@ -334,3 +334,48 @@ def test_sample_lights_does_not_raise_at_a_high_area_threshold():
     rng = np.random.default_rng(0)
     for _ in range(200):
         assert len(sample_lights(profile, 480, 854, rng)) >= 1
+
+
+def _area_ratio_of(lights, frame_height, frame_width):
+    return sum(_light_area(light) for light in lights) / (frame_height * frame_width)
+
+
+def test_sample_lights_produces_a_range_of_areas_not_one_fixed_value():
+    # The whole point of this change: before it, every draw under a profile
+    # produced essentially the same total area, so the model never saw a
+    # localized flash and a near-full-screen one as different problems.
+    rng = np.random.default_rng(0)
+    frame_height, frame_width = 480, 854
+
+    ratios = [
+        _area_ratio_of(sample_lights(PROFILE, frame_height, frame_width, rng), frame_height, frame_width)
+        for _ in range(200)
+    ]
+
+    assert max(ratios) - min(ratios) > 0.15
+
+
+def test_sample_lights_area_always_exceeds_the_profile_threshold():
+    # Randomizing area must never produce a sample that isn't actually
+    # hazardous -- _require_exceeds guards this, and this test pins that the
+    # guard still covers every draw.
+    rng = np.random.default_rng(1)
+    frame_height, frame_width = 480, 854
+
+    for _ in range(200):
+        lights = sample_lights(PROFILE, frame_height, frame_width, rng)
+        assert _area_ratio_of(lights, frame_height, frame_width) > PROFILE.max_area_ratio
+
+
+def test_sample_lights_handles_a_profile_whose_floor_meets_the_ceiling():
+    # max_area_ratio 0.50 + _AREA_MARGIN 0.10 lands exactly on
+    # _MAX_LIGHTS_AREA_RATIO 0.60, leaving an empty range -- must use the
+    # floor rather than raising or sampling from an inverted interval.
+    profile = ThresholdProfile(
+        name="edge", max_flashes_per_second=3, max_area_ratio=0.50,
+        general_flash_dark_threshold=0.80, general_flash_delta_threshold=0.10,
+        red_saturation_ratio_threshold=0.80,
+    )
+    rng = np.random.default_rng(2)
+    lights = sample_lights(profile, 480, 854, rng)
+    assert _area_ratio_of(lights, 480, 854) > profile.max_area_ratio

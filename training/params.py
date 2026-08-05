@@ -377,10 +377,21 @@ def sample_lights(
     rng: np.random.Generator,
 ) -> list[LightShape]:
     n_lights = int(rng.integers(1, _MAX_LIGHTS + 1))
-    target_total_area = min(
-        (profile.max_area_ratio + _AREA_MARGIN) * frame_height * frame_width,
-        _MAX_LIGHTS_AREA_RATIO * frame_height * frame_width,
-    )
+    # Sample the severity rather than fixing it at "just barely over the
+    # profile's threshold": real footage ranges from a small localized
+    # flash to nearly the whole frame (74.8% measured on the concert clip
+    # this data is meant to represent), and a model that only ever trained
+    # on threshold-hugging areas has never seen the severe case. Uniform, so
+    # mild and severe get equal representation.
+    # _MAX_LIGHTS_AREA_RATIO stays a hard ceiling, exactly as the previous
+    # `min(floor, ceiling)` made it. Clamping the floor to it (rather than
+    # raising the ceiling to meet the floor) keeps a profile whose own
+    # threshold sits above the cap unsatisfiable, so `_require_exceeds`
+    # below still reports it as the configuration error it is instead of
+    # silently generating past the cap.
+    min_area_ratio = min(profile.max_area_ratio + _AREA_MARGIN, _MAX_LIGHTS_AREA_RATIO)
+    target_area_ratio = float(rng.uniform(min_area_ratio, _MAX_LIGHTS_AREA_RATIO))
+    target_total_area = target_area_ratio * frame_height * frame_width
     per_light_area = target_total_area / n_lights
 
     # Each light must clear its equal share of the profile's threshold, so
