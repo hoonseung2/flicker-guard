@@ -31,6 +31,12 @@ _AREA_MARGIN = 0.10
 _MAX_AREA_RATIO = 0.90
 _RATIO_MARGIN = 0.05
 _MAX_SATURATION_TARGET = 0.99
+# Below this the red channel carries too little signal for `gb_sum` to leave
+# a recognisable red flash once the saturation ratio is applied.
+_MIN_RED_TARGET = 0.5
+# A baseline as bright as the red pulse itself erases the very contrast the
+# red pattern depends on.
+_MAX_RED_BASELINE = 0.5
 
 
 class ClipTooShortError(ValueError):
@@ -197,8 +203,25 @@ def sample_synthesis_params(
     )
 
     if pattern == "general":
-        dark_target = profile.general_flash_dark_threshold * 0.5
-        bright_target = min(1.0, dark_target + profile.general_flash_delta_threshold + 0.1)
+        # Sample the contrast instead of always emitting the mildest
+        # threshold-clearing pair. The previous fixed values sit at the ends
+        # of these ranges (darkest-allowed dark, mildest-allowed bright), so
+        # this only widens what gets generated -- it never drops what used
+        # to work.
+        # Cap dark_target so a bright_target clearing the delta threshold
+        # always fits under 1.0. Without this cap the draw decides whether
+        # the profile is satisfiable: a low dark leaves room and a high one
+        # does not, so the same profile would raise on some samples and not
+        # others -- random mid-run failures rather than a clean config
+        # error. A profile that leaves no room at all yields max_dark <= 0,
+        # pins dark at 0, and fails `_require_exceeds` below every time.
+        max_dark = min(
+            profile.general_flash_dark_threshold * 0.5,
+            1.0 - profile.general_flash_delta_threshold - 0.1,
+        )
+        dark_target = float(rng.uniform(0.0, max_dark)) if max_dark > 0.0 else 0.0
+        min_bright = min(1.0, dark_target + profile.general_flash_delta_threshold + 0.1)
+        bright_target = float(rng.uniform(min_bright, 1.0)) if min_bright < 1.0 else 1.0
         _require_exceeds(
             bright_target - dark_target, profile.general_flash_delta_threshold, profile.name,
             "general_flash_delta_threshold", "injected luminance delta",
@@ -206,16 +229,28 @@ def sample_synthesis_params(
         )
         return SynthParams(pattern="general", window=window, dark_target=dark_target, bright_target=bright_target)
 
-    target_ratio = min(_MAX_SATURATION_TARGET, profile.red_saturation_ratio_threshold + _RATIO_MARGIN)
+    # Sample the saturation ratio across everything above the profile's
+    # threshold rather than sitting one fixed margin above it.
+    min_ratio = min(_MAX_SATURATION_TARGET, profile.red_saturation_ratio_threshold + _RATIO_MARGIN)
+    target_ratio = (
+        float(rng.uniform(min_ratio, _MAX_SATURATION_TARGET))
+        if min_ratio < _MAX_SATURATION_TARGET
+        else min_ratio
+    )
     _require_exceeds(
         target_ratio, profile.red_saturation_ratio_threshold, profile.name,
         "red_saturation_ratio_threshold", "injected red saturation ratio",
         f"the target is capped at {_MAX_SATURATION_TARGET} (_MAX_SATURATION_TARGET)",
     )
-    r = 0.9
+    # r and the baseline were hardcoded constants -- not even
+    # profile-derived -- so every red sample ever generated was the same
+    # color against the same gray. Real footage varies both (R measured
+    # oscillating 0.17-0.50 on the concert clip).
+    r = float(rng.uniform(_MIN_RED_TARGET, _MAX_SATURATION_TARGET))
     gb_sum = r / target_ratio - r
     red_rgb = (r, gb_sum / 2, gb_sum / 2)
-    baseline_rgb = (0.3, 0.3, 0.3)
+    baseline_value = float(rng.uniform(0.0, _MAX_RED_BASELINE))
+    baseline_rgb = (baseline_value, baseline_value, baseline_value)
     return SynthParams(pattern="red", window=window, red_rgb=red_rgb, baseline_rgb=baseline_rgb)
 
 

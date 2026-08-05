@@ -6,6 +6,9 @@ import pytest
 from detector.profiles import ThresholdProfile, load_profile
 from training.params import (
     _LIGHT_KINDS,
+    _MAX_RED_BASELINE,
+    _MAX_SATURATION_TARGET,
+    _MIN_RED_TARGET,
     ClipTooShortError,
     LightShape,
     _achieved_area,
@@ -118,16 +121,42 @@ def test_sample_synthesis_params_rejects_profile_whose_saturation_target_is_unre
 
 
 def test_sample_synthesis_params_rejects_profile_whose_delta_target_is_unreachable():
-    # bright_target is clamped at 1.0, so a large delta threshold combined
-    # with a high dark threshold leaves no room for the required delta.
+    # Luminance targets live in [0, 1], so the widest delta obtainable is
+    # exactly 1.0 -- a profile demanding strictly more than that can never
+    # be satisfied, however the targets are sampled.
+    #
+    # This used to use delta_threshold=0.60 with dark_threshold=1.00, which
+    # the pre-randomization code could not satisfy only because it pinned
+    # dark_target at half the dark threshold (0.5), leaving at most 0.5 of
+    # headroom. Sampling dark_target down toward 0 finds the room that
+    # profile always had, so it is no longer an example of an unreachable
+    # delta.
     profile = ThresholdProfile(
         name="delta-cliff", max_flashes_per_second=3, max_area_ratio=0.10,
-        general_flash_dark_threshold=1.00, general_flash_delta_threshold=0.60,
+        general_flash_dark_threshold=1.00, general_flash_delta_threshold=1.00,
         red_saturation_ratio_threshold=0.80,
     )
     rng = np.random.default_rng(0)
     with pytest.raises(ValueError, match="delta-cliff"):
         sample_synthesis_params(profile, "general", clip_frame_count=90, frame_height=100, frame_width=100, fps=30.0, rng=rng)
+
+
+def test_general_pattern_satisfiability_does_not_depend_on_the_draw():
+    # dark_target is capped so a clearing bright_target always fits under
+    # 1.0. Without that cap a low dark leaves room and a high one does not,
+    # so the same profile would raise on some samples and not others --
+    # random mid-run batch failures instead of a clean config error.
+    profile = ThresholdProfile(
+        name="tight-delta", max_flashes_per_second=3, max_area_ratio=0.10,
+        general_flash_dark_threshold=1.00, general_flash_delta_threshold=0.60,
+        red_saturation_ratio_threshold=0.80,
+    )
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        params = sample_synthesis_params(
+            profile, "general", clip_frame_count=90, frame_height=100, frame_width=100, fps=30.0, rng=rng
+        )
+        assert params.bright_target - params.dark_target > profile.general_flash_delta_threshold
 
 
 @pytest.mark.parametrize("filename", ["kr.json", "jp.json", "itu.json", "ofcom.json", "w3c.json", "netflix.json"])
@@ -379,3 +408,60 @@ def test_sample_lights_handles_a_profile_whose_floor_meets_the_ceiling():
     rng = np.random.default_rng(2)
     lights = sample_lights(profile, 480, 854, rng)
     assert _area_ratio_of(lights, 480, 854) > profile.max_area_ratio
+
+
+_CONTRAST_PROFILE = ThresholdProfile(
+    name="contrast", max_flashes_per_second=3, max_area_ratio=0.10,
+    general_flash_dark_threshold=0.80, general_flash_delta_threshold=0.10,
+    red_saturation_ratio_threshold=0.80,
+)
+
+
+def _sample_many(pattern, n=200, seed=0):
+    rng = np.random.default_rng(seed)
+    return [
+        sample_synthesis_params(
+            _CONTRAST_PROFILE, pattern, clip_frame_count=200,
+            frame_height=480, frame_width=854, fps=24.0, rng=rng,
+        )
+        for _ in range(n)
+    ]
+
+
+def test_general_pattern_contrast_is_sampled_not_fixed():
+    # Before this change every general-pattern example under a profile had
+    # byte-identical dark/bright targets -- the minimum contrast that just
+    # clears the threshold, never anything more severe.
+    samples = _sample_many("general")
+    assert len({s.dark_target for s in samples}) > 50
+    assert len({s.bright_target for s in samples}) > 50
+
+
+def test_general_pattern_contrast_always_clears_the_delta_threshold():
+    # Randomizing must not let a sample fall below the profile's own
+    # threshold -- it would be a "hazard" the Detector never flags.
+    for s in _sample_many("general", seed=1):
+        assert 0.0 <= s.dark_target <= _CONTRAST_PROFILE.general_flash_dark_threshold * 0.5
+        assert s.bright_target <= 1.0
+        assert s.bright_target - s.dark_target > _CONTRAST_PROFILE.general_flash_delta_threshold
+
+
+def test_red_pattern_color_is_sampled_not_hardcoded():
+    # r was a hardcoded 0.9 and baseline a hardcoded (0.3, 0.3, 0.3),
+    # independent of profile -- every red example in the entire dataset was
+    # the same color against the same gray.
+    samples = _sample_many("red", seed=2)
+    assert len({s.red_rgb[0] for s in samples}) > 50
+    assert len({s.baseline_rgb[0] for s in samples}) > 50
+
+
+def test_red_pattern_stays_within_its_bounds_and_clears_the_threshold():
+    for s in _sample_many("red", seed=3):
+        r, g, b = s.red_rgb
+        assert _MIN_RED_TARGET <= r <= _MAX_SATURATION_TARGET
+        base = s.baseline_rgb[0]
+        assert 0.0 <= base <= _MAX_RED_BASELINE
+        assert s.baseline_rgb == (base, base, base)
+        # The saturation ratio the injected red actually achieves must
+        # exceed the profile's threshold, or the sample isn't hazardous.
+        assert r / (r + g + b) > _CONTRAST_PROFILE.red_saturation_ratio_threshold
