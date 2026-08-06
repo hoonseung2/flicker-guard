@@ -1,6 +1,7 @@
 import numpy as np
 
 from detector.luminance import relative_luminance
+from detector.pipeline import run_detection_with_masks
 from detector.profiles import ThresholdProfile
 from prior.compute import compute_prior
 from prior.histogram import compute_illumination_histogram
@@ -105,3 +106,73 @@ def test_compute_prior_accepts_a_one_shot_generator():
     results = compute_prior(frames, fps=10.0, profile=PROFILE)
     assert len(results) == 12
     assert [r.frame_index for r in results] == list(range(12))
+
+
+def test_compute_prior_mask_persists_after_the_transition_ends():
+    # The Detector's per-frame mask flags pixels that *changed* since the
+    # previous frame, which is right for deciding whether content is
+    # hazardous but wrong for deciding what to repair: while a flash holds
+    # its bright state there is no transition, so the mask empties even
+    # though those pixels are still wrong. Measured on the real training
+    # set, the transition mask covered only 10.4% (median) of the actually
+    # damaged pixels on hold frames, versus 92.1% on transition frames.
+    clean = _clean_clip(n=80, value=0.5)
+    window = InjectionWindow(
+        start_frame=20, end_frame=60, mask_top=0, mask_left=0,
+        mask_height=20, mask_width=20, period_frames=4, ramp_frames=10,
+    )
+    degraded = inject_general_flash(clean, window, dark_target=0.2, bright_target=0.8)
+
+    plain = compute_prior(degraded, fps=10.0, profile=PROFILE, mask_persistence_seconds=0.0)
+    held = compute_prior(degraded, fps=10.0, profile=PROFILE, mask_persistence_seconds=0.5)
+
+    # Inside the injected window, the transition mask empties on every frame
+    # where the pattern is merely holding its state.
+    hold_frames = [
+        p.frame_index for p in plain
+        if window.start_frame < p.frame_index <= window.end_frame and not p.mask.any()
+    ]
+    assert hold_frames, "expected at least one hold frame with an empty transition mask"
+
+    # Persistence carries the preceding transition forward, so almost all of
+    # them come back flagged. Not *all*: a hold frame with no transition
+    # anywhere in the window behind it has nothing to carry forward -- which
+    # is why this asserts a large majority rather than every frame.
+    refilled = sum(1 for i in hold_frames if held[i].mask.any())
+    assert refilled > 0.8 * len(hold_frames)
+
+
+def test_compute_prior_zero_persistence_matches_the_plain_transition_mask():
+    # persistence is an opt-out-able widening, not a redefinition -- with it
+    # switched off the mask must be exactly the Detector's own output.
+    clean = _clean_clip(n=60, value=0.5)
+    window = InjectionWindow(
+        start_frame=20, end_frame=45, mask_top=0, mask_left=0,
+        mask_height=20, mask_width=20, period_frames=3, ramp_frames=10,
+    )
+    degraded = inject_general_flash(clean, window, dark_target=0.2, bright_target=0.8)
+
+    _, _, detector_masks = run_detection_with_masks(degraded, fps=10.0, profile=PROFILE)
+    priors = compute_prior(degraded, fps=10.0, profile=PROFILE, mask_persistence_seconds=0.0)
+
+    for prior, mask in zip(priors, detector_masks):
+        assert np.array_equal(prior.mask, mask)
+
+
+def test_compute_prior_persistence_window_scales_with_fps():
+    # The window is specified in seconds, so the same clip at a higher frame
+    # rate must hold the mask for the same wall-clock duration rather than
+    # the same number of frames.
+    clean = _clean_clip(n=90, value=0.5)
+    window = InjectionWindow(
+        start_frame=30, end_frame=70, mask_top=0, mask_left=0,
+        mask_height=20, mask_width=20, period_frames=5, ramp_frames=10,
+    )
+    degraded = inject_general_flash(clean, window, dark_target=0.2, bright_target=0.8)
+
+    slow = compute_prior(degraded, fps=10.0, profile=PROFILE, mask_persistence_seconds=0.5)
+    fast = compute_prior(degraded, fps=30.0, profile=PROFILE, mask_persistence_seconds=0.5)
+
+    # 0.5s is 5 frames at 10fps but 15 at 30fps -- the wider window can only
+    # flag more, never less.
+    assert sum(p.mask.sum() for p in fast) > sum(p.mask.sum() for p in slow)

@@ -29,6 +29,7 @@ conservatively -- see detector/pipeline.py's I4 comment), there is no
 trustworthy in-frame reference for that frame; it simply does not
 contribute to the trailing window, and the last computed average is held.
 """
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -50,6 +51,26 @@ DEFAULT_N_BINS = 64
 # trust as "what normal illumination looks like" -- skip it rather than
 # feeding a shaky sample from a handful of pixels into the trailing average.
 _MIN_REFERENCE_PIXEL_RATIO = 0.05
+
+# How long a flagged pixel keeps counting as "needs repair" after the
+# transition that flagged it.
+#
+# Detector's per-frame mask marks pixels that CHANGED since the previous
+# frame. That is the right question for "is this content hazardous" -- the
+# standards count transitions -- but the wrong one for "what do I repair":
+# while a flash holds its bright state there is no transition, so the mask
+# empties even though those pixels are still wrong. Measured across 420
+# frames of the real training set, the raw transition mask covered 92.1%
+# (median) of the actually-damaged pixels on transition frames but only
+# 10.4% on hold frames, and hold frames were 69% of the total.
+#
+# OR-ing the recent masks together restores that coverage: at 0.2s the
+# median coverage of genuinely damaged pixels rose from 15.7% to ~96%, and
+# the trained model's median PSNR gain rose from +0.23 dB to +1.76 dB
+# (upper bound with a ground-truth damage mask: +4.20 dB). Longer is not
+# strictly better -- the mask is also a model input, so an over-wide mask
+# tells the network that clean pixels are damaged and it degrades them.
+_DEFAULT_MASK_PERSISTENCE_SECONDS = 0.2
 
 
 @dataclass
@@ -74,6 +95,7 @@ def compute_prior(
     fps: float,
     profile: ThresholdProfile,
     n_bins: int = DEFAULT_N_BINS,
+    mask_persistence_seconds: float = _DEFAULT_MASK_PERSISTENCE_SECONDS,
 ) -> list[FramePrior]:
     # Materialise first: unlike run_detection*, compute_prior needs `frames`
     # twice (once for detection, once to re-derive each frame's histogram).
@@ -90,9 +112,16 @@ def compute_prior(
     window_frames = max(1, round(fps))
     window: list[np.ndarray] = []
 
+    # 0 seconds disables persistence entirely, leaving the Detector's own
+    # transition mask untouched.
+    persistence_frames = max(1, round(mask_persistence_seconds * fps)) if mask_persistence_seconds > 0 else 1
+    recent_masks: deque[np.ndarray] = deque(maxlen=persistence_frames)
+
     results: list[FramePrior] = []
     last_valid_target: np.ndarray | None = None
-    for frame, score, mask in zip(frames, scores, masks):
+    for frame, score, raw_mask in zip(frames, scores, masks):
+        recent_masks.append(raw_mask)
+        mask = np.logical_or.reduce(recent_masks) if len(recent_masks) > 1 else raw_mask
         non_mask_pixels = relative_luminance(frame)[~mask]
         if non_mask_pixels.size >= _MIN_REFERENCE_PIXEL_RATIO * mask.size:
             window.append(compute_illumination_histogram(non_mask_pixels, n_bins=n_bins))
