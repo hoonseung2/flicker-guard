@@ -163,8 +163,7 @@ class MitigatorDataset(Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
-    def __getitem__(self, idx: int) -> dict:
-        sample_dir, frame_index = self._index[idx]
+    def _build_example(self, sample_dir: Path, frame_index: int) -> dict:
         prior = self._priors_by_sample[sample_dir][frame_index]
         n_frames = self._frame_counts[sample_dir]
 
@@ -187,3 +186,30 @@ class MitigatorDataset(Dataset):
             "histogram": torch.from_numpy(prior.target_histogram).float(),
             "clean": torch.from_numpy(clean_center.transpose(2, 0, 1)).float(),
         }
+
+    def __getitem__(self, idx: int) -> dict:
+        sample_dir, frame_index = self._index[idx]
+        example = self._build_example(sample_dir, frame_index)
+
+        # The temporal consistency term needs two consecutive *restored*
+        # frames, which means running the model on a neighbour -- so the
+        # neighbour's full input (window, mask, histogram) travels with the
+        # example rather than being reconstructed in the training loop.
+        #
+        # Only risky, has-target frames are retained in _priors_by_sample,
+        # so the successor is missing at a segment's last frame. Pairing
+        # such a frame with itself makes the predicted and target luminance
+        # deltas both zero, contributing nothing to the temporal term --
+        # preferable to pairing it with an unrelated frame from elsewhere in
+        # the clip, which would charge the model for a difference that isn't
+        # flicker. Risk segments are contiguous, so this affects one frame
+        # per segment.
+        sample_priors = self._priors_by_sample[sample_dir]
+        partner_index = frame_index + 1 if (frame_index + 1) in sample_priors else frame_index
+        partner = self._build_example(sample_dir, partner_index)
+
+        example["window_partner"] = partner["window"]
+        example["mask_partner"] = partner["mask"]
+        example["histogram_partner"] = partner["histogram"]
+        example["clean_partner"] = partner["clean"]
+        return example

@@ -232,3 +232,44 @@ def test_dataset_raises_clear_error_when_meta_json_has_no_fps(tmp_path):
     split = clip_split("clipJ")
     with pytest.raises(KeyError, match="fps"):
         MitigatorDataset(tmp_path, PROFILE, split=split)
+
+
+def test_getitem_returns_a_partner_frame_for_the_temporal_loss(tmp_path):
+    # The temporal consistency term compares two consecutive restored
+    # frames, so one example has to carry everything needed to run the
+    # model on its neighbour as well.
+    _write_fake_sample(tmp_path, "clipT", n_frames=20, h=8, w=8, fps=10.0,
+                       segments=[{"start_frame": 12, "end_frame": 15}])
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=clip_split("clipT"))
+    example = dataset[0]
+    assert example["window_partner"].shape == (9, 8, 8)
+    assert example["mask_partner"].shape == (1, 8, 8)
+    assert example["histogram_partner"].shape == (64,)
+    assert example["clean_partner"].shape == (3, 8, 8)
+
+
+def test_partner_is_the_next_frame_when_it_is_also_indexed(tmp_path):
+    _write_fake_sample(tmp_path, "clipU", n_frames=20, h=8, w=8, fps=10.0,
+                       segments=[{"start_frame": 12, "end_frame": 15}])
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=clip_split("clipU"))
+    frame_indices = [idx for _, idx in dataset._index]
+    pos = frame_indices.index(min(frame_indices))
+    example = dataset[pos]
+    # The partner's window is centred one frame later, so the partner's
+    # centre must equal this example's "next" slice.
+    assert torch.equal(example["window"][6:9], example["window_partner"][3:6])
+
+
+def test_partner_falls_back_to_the_frame_itself_at_a_segment_end(tmp_path):
+    # The last frame of a segment has no indexed successor. Pairing it with
+    # itself makes both the predicted and the target luminance delta zero,
+    # so it contributes nothing to the temporal term rather than inventing
+    # a partner from an unrelated part of the clip.
+    _write_fake_sample(tmp_path, "clipV", n_frames=20, h=8, w=8, fps=10.0,
+                       segments=[{"start_frame": 12, "end_frame": 15}])
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=clip_split("clipV"))
+    frame_indices = [idx for _, idx in dataset._index]
+    pos = frame_indices.index(max(frame_indices))
+    example = dataset[pos]
+    assert torch.equal(example["window"], example["window_partner"])
+    assert torch.equal(example["clean"], example["clean_partner"])

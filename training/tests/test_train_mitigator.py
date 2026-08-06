@@ -28,6 +28,12 @@ class _FixedBatchDataset(torch.utils.data.Dataset):
             "mask": self.mask,
             "histogram": self.histogram,
             "clean": self.clean,
+            # compute_losses restores the centre frame and its temporal
+            # partner together, so every example must carry both.
+            "window_partner": self.window,
+            "mask_partner": self.mask,
+            "histogram_partner": self.histogram,
+            "clean_partner": self.clean,
         }
 
 
@@ -175,6 +181,12 @@ class _FakeMitigatorDataset(torch.utils.data.Dataset):
             "mask": self.mask,
             "histogram": self.histogram,
             "clean": self.clean,
+            # compute_losses restores the centre frame and its temporal
+            # partner together, so every example must carry both.
+            "window_partner": self.window,
+            "mask_partner": self.mask,
+            "histogram_partner": self.histogram,
+            "clean_partner": self.clean,
         }
 
 
@@ -193,8 +205,8 @@ def test_main_resume_does_not_clobber_best_pt_with_worse_checkpoint(tmp_path, mo
     # would have restored.
     scripted_losses = iter([0.5, 0.2, 0.3])
 
-    def _fake_evaluate(model, dataloader, device):
-        return {"loss": next(scripted_losses), "psnr": 0.0}
+    def _fake_evaluate(model, dataloader, device, lambda_temporal=0.0):
+        return {"loss": next(scripted_losses), "reconstruction": 0.0, "temporal": 0.0, "psnr": 0.0}
 
     monkeypatch.setattr(train_mitigator_module, "evaluate", _fake_evaluate)
 
@@ -239,6 +251,10 @@ class _VariableShapeMitigatorDataset(torch.utils.data.Dataset):
             "mask": torch.ones(1, h, w),
             "histogram": torch.rand(64),
             "clean": torch.rand(3, h, w),
+            "window_partner": torch.rand(9, h, w),
+            "mask_partner": torch.ones(1, h, w),
+            "histogram_partner": torch.rand(64),
+            "clean_partner": torch.rand(3, h, w),
         }
 
 
@@ -453,3 +469,78 @@ def test_patch_collate_fn_keeps_window_mask_clean_spatially_aligned():
         # Wherever the crop landed, the marker is either in all three or none.
         present = [bool(out[k][0, 0].max() > 0) for k in ("window", "mask", "clean")]
         assert len(set(present)) == 1
+
+
+def test_patch_collate_crops_partner_tensors_with_the_same_offset():
+    # The partner frame is the same clip one frame later, so it must be
+    # cropped to the same window as the centre frame -- a different offset
+    # would make the luminance delta between them a delta between two
+    # different regions of the picture, which is not flicker.
+    from training.train_mitigator import _make_patch_collate_fn
+
+    collate = _make_patch_collate_fn(4)
+    # A horizontal ramp: any misalignment between the two crops shows up as
+    # a constant offset between them, which a uniform field could not reveal.
+    ramp = torch.arange(8, dtype=torch.float32).repeat(8, 1)
+    item = {
+        "window": ramp.expand(9, 8, 8).clone(),
+        "mask": ramp.expand(1, 8, 8).clone(),
+        "clean": ramp.expand(3, 8, 8).clone(),
+        "histogram": torch.zeros(64),
+        "window_partner": ramp.expand(9, 8, 8).clone(),
+        "mask_partner": ramp.expand(1, 8, 8).clone(),
+        "clean_partner": ramp.expand(3, 8, 8).clone(),
+        "histogram_partner": torch.zeros(64),
+    }
+    batch = collate([item, item])
+    assert batch["window_partner"].shape == batch["window"].shape
+    assert torch.equal(batch["window"][:, :3], batch["window_partner"][:, :3])
+    assert torch.equal(batch["clean"], batch["clean_partner"])
+
+
+class _FlickeringPairDataset(torch.utils.data.Dataset):
+    """A pair whose clean frames are identical but whose degraded frames
+    differ in brightness -- i.e. pure flicker, nothing else."""
+
+    def __init__(self, h=16, w=16):
+        torch.manual_seed(0)
+        base = torch.rand(3, h, w) * 0.4 + 0.2
+        self.clean = base
+        self.mask = torch.ones(1, h, w)
+        self.histogram = torch.rand(64)
+        self.dark = torch.cat([base, base, base], dim=0)
+        self.bright = torch.cat([base, (base + 0.4), (base + 0.4)], dim=0)
+
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, idx):
+        return {
+            "window": self.dark, "mask": self.mask,
+            "histogram": self.histogram, "clean": self.clean,
+            "window_partner": self.bright, "mask_partner": self.mask,
+            "histogram_partner": self.histogram, "clean_partner": self.clean,
+        }
+
+
+def test_lambda_temporal_zero_reproduces_the_reconstruction_only_objective():
+    from training.train_mitigator import compute_losses
+
+    model = MitigatorNet()
+    batch = torch.utils.data.default_collate([_FlickeringPairDataset()[0]])
+    losses = compute_losses(batch, model, device="cpu", lambda_temporal=0.0)
+    assert losses["loss"].item() == pytest.approx(losses["reconstruction"].item(), abs=1e-6)
+
+
+def test_temporal_term_charges_for_flicker_the_clean_pair_does_not_have():
+    # Both clean frames are identical, so any brightness difference between
+    # the two restored frames is pure residual flicker and must cost
+    # something -- this is precisely what the per-frame reconstruction loss
+    # cannot see.
+    from training.train_mitigator import compute_losses
+
+    model = MitigatorNet()
+    batch = torch.utils.data.default_collate([_FlickeringPairDataset()[0]])
+    losses = compute_losses(batch, model, device="cpu", lambda_temporal=1.0)
+    assert losses["temporal"].item() > 0.0
+    assert losses["loss"].item() > losses["reconstruction"].item()

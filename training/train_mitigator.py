@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, default_collate
 from detector.profiles import load_profile
 from mitigator.arch import MitigatorNet, mitigate_frame
 from training.mitigator_dataset import MitigatorDataset
-from training.mitigator_losses import l1_ssim_loss, psnr
+from training.mitigator_losses import l1_ssim_loss, psnr, temporal_consistency_loss
 
 
 def save_checkpoint(
@@ -46,24 +46,47 @@ def load_checkpoint(path: Path, model: MitigatorNet, optimizer: torch.optim.Opti
     return checkpoint["epoch"], best_val_loss
 
 
+def compute_losses(batch: dict, model: MitigatorNet, device: str, lambda_temporal: float) -> dict:
+    """Restores the centre frame and its partner, and returns the loss terms.
+
+    Both frames go through the model in a single forward pass (concatenated
+    along the batch axis) rather than two calls: same arithmetic, one kernel
+    launch sequence, and it keeps the reconstruction term applied to both
+    outputs so the partner is never left graded only by the relative
+    temporal term.
+    """
+    n = batch["window"].shape[0]
+    window = torch.cat([batch["window"], batch["window_partner"]], dim=0).to(device)
+    mask = torch.cat([batch["mask"], batch["mask_partner"]], dim=0).to(device)
+    histogram = torch.cat([batch["histogram"], batch["histogram_partner"]], dim=0).to(device)
+    clean = torch.cat([batch["clean"], batch["clean_partner"]], dim=0).to(device)
+
+    restored = mitigate_frame(window, mask, histogram, model)
+    reconstruction = l1_ssim_loss(restored, clean)
+    temporal = temporal_consistency_loss(restored[:n], restored[n:], clean[:n], clean[n:])
+    return {
+        "loss": reconstruction + lambda_temporal * temporal,
+        "reconstruction": reconstruction,
+        "temporal": temporal,
+        # PSNR stays a centre-frame-only measure so it remains comparable
+        # with checkpoints trained before the partner frame existed.
+        "psnr": psnr(restored[:n], clean[:n]),
+    }
+
+
 def train_one_epoch(
     model: MitigatorNet,
     optimizer: torch.optim.Optimizer,
     dataloader: DataLoader,
     device: str,
+    lambda_temporal: float = 0.0,
 ) -> float:
     model.train()
     total_loss = 0.0
     n_batches = 0
     for batch in dataloader:
-        window = batch["window"].to(device)
-        mask = batch["mask"].to(device)
-        histogram = batch["histogram"].to(device)
-        clean = batch["clean"].to(device)
-
         optimizer.zero_grad()
-        restored = mitigate_frame(window, mask, histogram, model)
-        loss = l1_ssim_loss(restored, clean)
+        loss = compute_losses(batch, model, device, lambda_temporal)["loss"]
         loss_value = loss.item()
         if loss_value != loss_value:  # NaN check (NaN != NaN) -- fail loud, never train through it
             raise RuntimeError(
@@ -80,23 +103,17 @@ def train_one_epoch(
     return total_loss / n_batches
 
 
-def evaluate(model: MitigatorNet, dataloader: DataLoader, device: str) -> dict:
+def evaluate(model: MitigatorNet, dataloader: DataLoader, device: str, lambda_temporal: float = 0.0) -> dict:
     model.eval()
-    total_loss = 0.0
-    total_psnr = 0.0
+    totals = {"loss": 0.0, "reconstruction": 0.0, "temporal": 0.0, "psnr": 0.0}
     n_batches = 0
     with torch.no_grad():
         for batch in dataloader:
-            window = batch["window"].to(device)
-            mask = batch["mask"].to(device)
-            histogram = batch["histogram"].to(device)
-            clean = batch["clean"].to(device)
-
-            restored = mitigate_frame(window, mask, histogram, model)
-            total_loss += l1_ssim_loss(restored, clean).item()
-            total_psnr += psnr(restored, clean).item()
+            losses = compute_losses(batch, model, device, lambda_temporal)
+            for key in totals:
+                totals[key] += losses[key].item()
             n_batches += 1
-    return {"loss": total_loss / n_batches, "psnr": total_psnr / n_batches}
+    return {key: value / n_batches for key, value in totals.items()}
 
 
 def _make_patch_collate_fn(patch_size: int):
@@ -130,14 +147,18 @@ def _make_patch_collate_fn(patch_size: int):
             top = torch.randint(0, max_top + 1, (1,)).item() if max_top > 0 else 0
             left = torch.randint(0, max_left + 1, (1,)).item() if max_left > 0 else 0
 
-            # Same (top, left) for window, mask, clean to keep them spatially
-            # aligned -- a misaligned crop would produce an invalid label.
-            cropped.append({
-                "window": item["window"][:, top:top + crop_h, left:left + crop_w],
-                "mask": item["mask"][:, top:top + crop_h, left:left + crop_w],
-                "clean": item["clean"][:, top:top + crop_h, left:left + crop_w],
-                "histogram": item["histogram"],
-            })
+            # Same (top, left) for every spatial tensor to keep them
+            # aligned -- a misaligned crop would produce an invalid label,
+            # and for the partner frame specifically it would turn the
+            # temporal loss's luminance delta into a delta between two
+            # different regions of the picture rather than a delta in time.
+            crop = {}
+            for key, value in item.items():
+                crop[key] = (
+                    value if value.dim() < 3
+                    else value[:, top:top + crop_h, left:left + crop_w]
+                )
+            cropped.append(crop)
 
         return default_collate(cropped)
 
@@ -158,6 +179,14 @@ def main(argv: list[str] | None = None) -> int:
         help="DataLoader worker processes. 0 (default) loads on the main thread, which "
              "starves the GPU once the dataset is large -- measured 12%% GPU utilisation "
              "and 596s/epoch on an H100. Set to roughly the core count.",
+    )
+    parser.add_argument(
+        "--lambda-temporal", type=float, default=1.0,
+        help="Weight on the temporal consistency term. L1/SSIM alone scores each "
+             "frame independently, which a proportional correction satisfies while "
+             "leaving the flicker pattern intact at lower amplitude -- measured on a "
+             "real clip as a 60%% smaller brightness jump but only 12%% fewer "
+             "transitions. 0 disables the term and reproduces the previous objective.",
     )
     parser.add_argument("--log-path")
     parser.add_argument("--patch-size", type=int, default=None,
@@ -242,8 +271,8 @@ def main(argv: list[str] | None = None) -> int:
 
     for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
-        train_loss = train_one_epoch(model, optimizer, train_loader, device)
-        val_metrics = evaluate(model, val_loader, device)
+        train_loss = train_one_epoch(model, optimizer, train_loader, device, args.lambda_temporal)
+        val_metrics = evaluate(model, val_loader, device, args.lambda_temporal)
         elapsed = time.time() - start_time
 
         # best_val_loss must reflect this epoch's result before latest.pt is
@@ -264,10 +293,18 @@ def main(argv: list[str] | None = None) -> int:
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_metrics["loss"],
+                "val_reconstruction": val_metrics["reconstruction"],
+                "val_temporal": val_metrics["temporal"],
                 "val_psnr": val_metrics["psnr"],
+                "lambda_temporal": args.lambda_temporal,
                 "elapsed_seconds": elapsed,
             }) + "\n")
+        # The two loss terms are printed separately because they trade off:
+        # a run where val_temporal falls while val_reconstruction rises is
+        # buying flicker suppression with picture fidelity, and the combined
+        # number alone would hide which way that trade is going.
         print(f"epoch {epoch}: train_loss={train_loss:.4f} val_loss={val_metrics['loss']:.4f} "
+              f"(recon={val_metrics['reconstruction']:.4f} temporal={val_metrics['temporal']:.4f}) "
               f"val_psnr={val_metrics['psnr']:.2f} ({elapsed:.1f}s)")
 
     return 0
