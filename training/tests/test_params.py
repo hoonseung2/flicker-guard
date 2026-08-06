@@ -465,3 +465,68 @@ def test_red_pattern_stays_within_its_bounds_and_clears_the_threshold():
         # The saturation ratio the injected red actually achieves must
         # exceed the profile's threshold, or the sample isn't hazardous.
         assert r / (r + g + b) > _CONTRAST_PROFILE.red_saturation_ratio_threshold
+
+
+def test_injected_duration_varies_when_the_clip_has_room():
+    # The injected window used to be a fixed length (window_frames + 4
+    # periods = 1.5s at 24fps) no matter how long the clip was. Measured on
+    # the real 190-sample dataset: a 30s source clip still got a 1.4s risky
+    # stretch, i.e. 4.7% of the clip, while the real concert footage this
+    # data stands in for was 87.8% risky. The model therefore never saw a
+    # sustained flicker during training.
+    rng = np.random.default_rng(0)
+    durations = {
+        sample_synthesis_params(
+            PROFILE, "general", clip_frame_count=720, frame_height=100, frame_width=100, fps=24.0, rng=rng
+        ).window.end_frame
+        - sample_synthesis_params(
+            PROFILE, "general", clip_frame_count=720, frame_height=100, frame_width=100, fps=24.0, rng=rng
+        ).window.start_frame
+        for _ in range(60)
+    }
+    assert len(durations) > 10
+
+
+def test_injected_duration_can_reach_many_seconds_on_a_long_clip():
+    # A 30s clip must be able to produce a risky stretch far longer than the
+    # old fixed 1.5s, since "long continuous strobe" is exactly the case the
+    # trained model failed on.
+    rng = np.random.default_rng(1)
+    fps = 24.0
+    longest = 0
+    for _ in range(80):
+        w = sample_synthesis_params(
+            PROFILE, "general", clip_frame_count=int(30 * fps),
+            frame_height=100, frame_width=100, fps=fps, rng=rng,
+        ).window
+        longest = max(longest, (w.end_frame - w.start_frame + 1) / fps)
+    assert longest > 8.0
+
+
+def test_injected_window_still_fits_the_clip_and_keeps_its_runway():
+    # Lengthening the window must not push it past the clip's end, nor eat
+    # the clean runway PriorCalc needs ahead of it to build a target.
+    rng = np.random.default_rng(2)
+    fps = 24.0
+    for clip_frames in (int(2 * fps), int(5 * fps), int(30 * fps)):
+        for _ in range(30):
+            w = sample_synthesis_params(
+                PROFILE, "general", clip_frame_count=clip_frames,
+                frame_height=100, frame_width=100, fps=fps, rng=rng,
+            ).window
+            assert w.start_frame >= 1
+            assert w.end_frame < clip_frames
+            # never shorter than the old fixed length -- the pattern still
+            # needs its ramp plus a steady-state tail to be detectable
+            assert (w.end_frame - w.start_frame + 1) >= w.ramp_frames + 2 * w.period_frames
+
+
+def test_short_clip_still_gets_the_minimum_window():
+    # A clip with only just enough frames must still produce the original
+    # fixed-length window rather than a randomly shortened one.
+    rng = np.random.default_rng(3)
+    fps = 24.0
+    w = sample_synthesis_params(
+        PROFILE, "general", clip_frame_count=40, frame_height=100, frame_width=100, fps=fps, rng=rng
+    ).window
+    assert (w.end_frame - w.start_frame + 1) == w.ramp_frames + 4 * w.period_frames

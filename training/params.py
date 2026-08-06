@@ -162,6 +162,22 @@ def sample_synthesis_params(
             f"{duration_frames + 1} for fps={fps} and profile {profile.name!r}"
         )
 
+    # `duration_frames` above is the MINIMUM a detectable pattern needs: the
+    # counter's ramp plus four periods of steady state. Emitting exactly that
+    # every time left a 30s source clip with a 1.4s risky stretch -- 4.7% of
+    # the clip -- while the real concert footage this data stands in for was
+    # 87.8% risky for 13 continuous seconds. The model consequently never saw
+    # a sustained flicker, only brief bursts.
+    #
+    # So treat the minimum as a floor and sample upward through whatever the
+    # clip can spare after reserving the runway PriorCalc needs ahead of the
+    # window. Short clips have no spare room and keep the old fixed length,
+    # which is why `test_short_clip_still_gets_the_minimum_window` pins that.
+    desired_runway = 2 * window_frames
+    spare = clip_frame_count - duration_frames - min(desired_runway, clip_frame_count - duration_frames)
+    if spare > 0:
+        duration_frames += int(rng.integers(0, spare + 1))
+
     latest_start = clip_frame_count - duration_frames
     # PriorCalc's TargetHistogramSmoother needs a stretch of genuinely clean
     # (non-risky, non-uncertain) frames before the injected segment to ever
