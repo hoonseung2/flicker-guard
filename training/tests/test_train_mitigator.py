@@ -402,3 +402,54 @@ def test_train_one_epoch_with_patch_collate_fn():
     loss = train_one_epoch(model, optimizer, dataloader, device="cpu")
     assert loss == loss  # finite check (NaN != NaN)
     assert loss != float("inf")
+
+
+def test_patch_collate_fn_handles_a_batch_of_differing_resolutions():
+    # Source clips don't all share one resolution: preserving aspect ratio
+    # when preparing them yields 854x480 alongside 854x450, and a batch can
+    # mix the two. The collate used to call default_collate first, which
+    # stacks -- so it raised "stack expects each tensor to be equal size"
+    # before any cropping could equalise the shapes.
+    collate_fn = _make_patch_collate_fn(patch_size=512)
+
+    batch = [
+        {
+            "window": torch.rand(9, 480, 854),
+            "mask": torch.ones(1, 480, 854),
+            "histogram": torch.rand(64),
+            "clean": torch.rand(3, 480, 854),
+        },
+        {
+            "window": torch.rand(9, 450, 854),
+            "mask": torch.ones(1, 450, 854),
+            "histogram": torch.rand(64),
+            "clean": torch.rand(3, 450, 854),
+        },
+    ]
+
+    out = collate_fn(batch)
+
+    # Everything crops to the smallest item's size, clamped by patch_size.
+    assert out["window"].shape == (2, 9, 450, 512)
+    assert out["mask"].shape == (2, 1, 450, 512)
+    assert out["clean"].shape == (2, 3, 450, 512)
+    assert out["histogram"].shape == (2, 64)
+
+
+def test_patch_collate_fn_keeps_window_mask_clean_spatially_aligned():
+    # A misaligned crop would pair a patch of the degraded window with a
+    # different patch of the clean frame -- an invalid training label.
+    collate_fn = _make_patch_collate_fn(patch_size=4)
+
+    marker = torch.zeros(1, 16, 16)
+    marker[0, 7, 9] = 1.0
+    window = torch.zeros(9, 16, 16)
+    window[0, 7, 9] = 1.0
+    clean = torch.zeros(3, 16, 16)
+    clean[0, 7, 9] = 1.0
+
+    for _ in range(40):
+        out = collate_fn([{"window": window, "mask": marker, "histogram": torch.rand(64), "clean": clean}])
+        # Wherever the crop landed, the marker is either in all three or none.
+        present = [bool(out[k][0, 0].max() > 0) for k in ("window", "mask", "clean")]
+        assert len(set(present)) == 1

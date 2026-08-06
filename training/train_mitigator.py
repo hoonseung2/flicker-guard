@@ -110,38 +110,36 @@ def _make_patch_collate_fn(patch_size: int):
         raise ValueError(f"patch_size must be positive, got {patch_size}")
 
     def collate_fn(batch_list):
-        batch_dict = default_collate(batch_list)
+        # Crop BEFORE stacking. Source clips don't all share one resolution --
+        # preserving aspect ratio when preparing them yields e.g. 854x480
+        # alongside 854x450 -- and default_collate stacks first, so calling it
+        # up front raises "stack expects each tensor to be equal size" before
+        # any cropping can equalise the shapes.
+        #
+        # The crop size is the smallest item's, not this item's: cropping each
+        # to its own min(patch_size, h) would still leave a 450-tall and a
+        # 480-tall crop in the same batch and fail at the stack just the same.
+        crop_h = min(patch_size, min(item["window"].shape[-2] for item in batch_list))
+        crop_w = min(patch_size, min(item["window"].shape[-1] for item in batch_list))
 
-        window = batch_dict["window"]
-        mask = batch_dict["mask"]
-        clean = batch_dict["clean"]
-        histogram = batch_dict["histogram"]
-
-        batch_size, _, h, w = window.shape
-        crop_h = min(patch_size, h)
-        crop_w = min(patch_size, w)
-
-        cropped_windows = []
-        cropped_masks = []
-        cropped_cleans = []
-
-        for i in range(batch_size):
-            max_top = max(0, h - crop_h)
-            max_left = max(0, w - crop_w)
+        cropped = []
+        for item in batch_list:
+            h, w = item["window"].shape[-2:]
+            max_top = h - crop_h
+            max_left = w - crop_w
             top = torch.randint(0, max_top + 1, (1,)).item() if max_top > 0 else 0
             left = torch.randint(0, max_left + 1, (1,)).item() if max_left > 0 else 0
 
-            # Use same (top, left) offset for window, mask, clean to keep them spatially aligned
-            cropped_windows.append(window[i, :, top:top+crop_h, left:left+crop_w])
-            cropped_masks.append(mask[i, :, top:top+crop_h, left:left+crop_w])
-            cropped_cleans.append(clean[i, :, top:top+crop_h, left:left+crop_w])
+            # Same (top, left) for window, mask, clean to keep them spatially
+            # aligned -- a misaligned crop would produce an invalid label.
+            cropped.append({
+                "window": item["window"][:, top:top + crop_h, left:left + crop_w],
+                "mask": item["mask"][:, top:top + crop_h, left:left + crop_w],
+                "clean": item["clean"][:, top:top + crop_h, left:left + crop_w],
+                "histogram": item["histogram"],
+            })
 
-        batch_dict["window"] = torch.stack(cropped_windows)
-        batch_dict["mask"] = torch.stack(cropped_masks)
-        batch_dict["clean"] = torch.stack(cropped_cleans)
-        batch_dict["histogram"] = histogram
-
-        return batch_dict
+        return default_collate(cropped)
 
     return collate_fn
 
