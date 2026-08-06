@@ -111,11 +111,48 @@ def render(frames, fps, segments, area_ratios, uncertain, out_path: Path, title:
     fig.savefig(out_path, dpi=150, facecolor=bg)
 
 
+def write_overlay(video_path: Path, masks, out_path: Path, fps: float) -> int:
+    """Re-decode the video and write a copy with the flagged pixels tinted.
+
+    Streams frame by frame rather than reusing the already-decoded list: at
+    native resolution a 39s 720p clip is ~10 GB of float32 frames, and
+    holding a second copy to draw on would double that.
+    """
+    import cv2
+
+    tint = np.array([0.0, 165.0, 240.0], dtype=np.float32)  # BGR amber
+    cap = cv2.VideoCapture(str(video_path))
+    writer = None
+    written = 0
+    try:
+        while written < len(masks):
+            ok, frame_bgr = cap.read()
+            if not ok:
+                break
+            mask = masks[written]
+            if frame_bgr.shape[:2] != mask.shape:
+                frame_bgr = cv2.resize(frame_bgr, (mask.shape[1], mask.shape[0]),
+                                       interpolation=cv2.INTER_AREA)
+            out = frame_bgr.astype(np.float32)
+            out[mask] = 0.45 * out[mask] + 0.55 * tint
+            if writer is None:
+                writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                                         fps, (out.shape[1], out.shape[0]))
+            writer.write(np.clip(out, 0, 255).astype(np.uint8))
+            written += 1
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+    return written
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Render where a video's PSE risk is and how much it covers.")
     parser.add_argument("--video", required=True)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--output", help="PNG path; omit to print the summary only")
+    parser.add_argument("--overlay", help="MP4 path: a copy of the video with flagged pixels tinted amber")
     parser.add_argument("--margin-seconds", type=float, default=0.5)
     parser.add_argument(
         "--max-dim", type=int, default=None,
@@ -157,6 +194,10 @@ def main(argv: list[str] | None = None) -> int:
                [s.uncertain for s in scores], Path(args.output),
                f"{video_path.name} — 위험 검출 리포트 ({profile.name})")
         print(f"-> {args.output}")
+
+    if args.overlay:
+        written = write_overlay(video_path, masks, Path(args.overlay), fps)
+        print(f"-> {args.overlay}  ({written}프레임, 주황색 = 위험 판정 화소)")
     return 0
 
 
