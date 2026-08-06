@@ -40,9 +40,14 @@ VIDEO_SUFFIXES = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi")
 DEFAULT_MAX_DIM = 480
 
 
-def read_frames_lenient(path: Path, max_dim: int) -> tuple[list[np.ndarray], float, str]:
+def read_frames_lenient(path: Path, max_dim: int | None) -> tuple[list[np.ndarray], float, str]:
     """Decode `path` to RGB float32 frames, downscaled so the long side is
-    at most `max_dim`. Returns (frames, fps, note).
+    at most `max_dim` (pass None to keep native resolution). Returns
+    (frames, fps, note).
+
+    Downscaling changes what the Detector sees and therefore what it flags,
+    so callers that report detection results rather than merely screening
+    in bulk should pass None.
 
     Deliberately does NOT use detector.cli.read_video_frames: that raises
     VideoReadError when a container declares more frames than actually
@@ -70,7 +75,7 @@ def read_frames_lenient(path: Path, max_dim: int) -> tuple[list[np.ndarray], flo
                 break
             if scale is None:
                 height, width = frame_bgr.shape[:2]
-                scale = min(1.0, max_dim / max(height, width))
+                scale = 1.0 if max_dim is None else min(1.0, max_dim / max(height, width))
             if scale < 1.0:
                 frame_bgr = cv2.resize(
                     frame_bgr,
