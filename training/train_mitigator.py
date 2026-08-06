@@ -153,6 +153,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--num-workers", type=int, default=0,
+        help="DataLoader worker processes. 0 (default) loads on the main thread, which "
+             "starves the GPU once the dataset is large -- measured 12%% GPU utilisation "
+             "and 596s/epoch on an H100. Set to roughly the core count.",
+    )
     parser.add_argument("--log-path")
     parser.add_argument("--patch-size", type=int, default=None,
                         help="Optional: random crop to this spatial size (e.g. 256) for VRAM-limited training on local GPUs. "
@@ -195,7 +201,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.patch_size is not None:
         collate_fn = _make_patch_collate_fn(args.patch_size)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
+    # Each example reads four PNGs off disk, so with a single-threaded loader
+    # the GPU starves: measured on an H100 with 9233 train examples, GPU
+    # utilisation sat at 12% and an epoch took 596s. Workers overlap that
+    # reading with compute. persistent_workers keeps them alive between
+    # epochs, which matters here because there are only ~2300 batches per
+    # epoch and re-forking each time would eat the gain.
+    loader_kwargs = {}
+    if args.num_workers > 0:
+        loader_kwargs = {
+            "num_workers": args.num_workers,
+            "persistent_workers": True,
+            "prefetch_factor": 4,
+            "pin_memory": device == "cuda",
+        }
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        collate_fn=collate_fn, **loader_kwargs,
+    )
     # Real source clips (e.g. DAVIS) don't all share one resolution, and val
     # is deliberately never cropped (see collate_fn=None above) to avoid
     # random-crop noise in the best.pt comparison -- so a val batch size > 1
@@ -203,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     # and crash. Validation doesn't need batching for throughput (no
     # backward pass), so batch_size=1 sidesteps this entirely while keeping
     # every val example at its real, uncropped resolution.
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=None)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=None, **loader_kwargs)
 
     model = MitigatorNet()
     model.to(device)
