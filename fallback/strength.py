@@ -46,8 +46,15 @@ def motion_compensated_deltas(frames: list[np.ndarray]) -> list[np.ndarray]:
 
 
 def required_strength(frames: list[np.ndarray], profile: ThresholdProfile) -> float:
-    """Smallest strength that brings every frame pair's flagged area to
-    `profile.max_area_ratio`, or 0.0 if none of them exceed it."""
+    """Smallest strength that brings the WORST frame pair's flagged area down
+    to `profile.max_area_ratio`, taken as the max of the per-pair minimum
+    strengths, or 0.0 if none of them exceed it.
+
+    This is a single value applied uniformly to every pair in `frames`, so
+    every pair milder than the worst one is over-corrected: their flagged
+    area lands below `profile.max_area_ratio`, not at it. Only the single
+    worst pair is brought exactly to the limit.
+    """
     threshold = profile.general_flash_delta_threshold
     quantile = 1.0 - profile.max_area_ratio
 

@@ -42,7 +42,7 @@ def test_real_concert_clip_passes_after_fallback():
         print(
             f"  {outcome.start_frame}-{outcome.end_frame}: "
             f"{outcome.initial_strength:.3f} -> {outcome.final_strength:.3f} "
-            f"({outcome.rounds} escalations)"
+            f"({outcome.escalations} escalations)"
         )
     print(f"mean luminance {mean_luminance(frames):.4f} -> {mean_luminance(corrected):.4f}")
     print(f"mean contrast  {mean_contrast(frames):.4f} -> {mean_contrast(corrected):.4f}")

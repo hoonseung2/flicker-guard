@@ -26,7 +26,7 @@ class SegmentOutcome:
     end_frame: int
     initial_strength: float
     final_strength: float
-    rounds: int  # escalations applied to THIS segment (0 if it passed on round 1)
+    escalations: int  # escalations applied to THIS segment (0 if it passed on round 1)
     passed: bool
 
 
@@ -139,6 +139,22 @@ def mitigate_with_fallback(
     judged under different conditions than the one that decides pass or
     fail.
     """
+    if max_rounds < 1:
+        # With max_rounds=0 the loop below never executes: `remaining` stays
+        # `[]`, so every SegmentOutcome.passed would compute True from
+        # `still_risky` being empty -- even though the returned frames are
+        # the same untouched, known-risky objects that went in. This
+        # function is deliberately pure so a future escalation-ladder caller
+        # can invoke it directly and trust per-segment `passed`; that caller
+        # is exactly the one a silently-wrong verdict would mislead.
+        # `FallbackReport.passed` alone would still be correct (it starts
+        # False and nothing sets it True), which is why the CLI's exit code
+        # was never wrong -- only the per-segment field lies.
+        raise ValueError(
+            f"max_rounds must be >= 1, got {max_rounds}: a zero-round run "
+            "never applies or re-verifies anything, so it cannot report a "
+            "meaningful per-segment pass/fail verdict."
+        )
     _scores, segments = run_detection(frames, fps=fps, profile=profile)
     if not segments:
         return list(frames), FallbackReport(
@@ -169,7 +185,16 @@ def mitigate_with_fallback(
     # `strengths` directly there would claim a strength that was bumped only
     # after the last frame was ever rendered, never actually applied to the
     # returned frames.
+    #
+    # `escalations_used` mirrors the same snapshot for `rounds_used`. Without
+    # it, the bottom of this loop increments `rounds_used[key]` unconditionally
+    # -- including on the final iteration, after the last `_apply_segments`
+    # call that will ever run -- so `rounds_used` alone would count an
+    # escalation that was computed but never applied, contradicting
+    # `strengths_used`/`final_strength` on exactly the non-convergent path
+    # this snapshot exists to report accurately.
     strengths_used = dict(strengths)
+    escalations_used = dict(rounds_used)
     remaining: list[RiskSegment] = []
     passed = False
     rounds = 0
@@ -179,6 +204,7 @@ def mitigate_with_fallback(
             frames, frames_linear, segments, strengths, window_frames, margin_frames
         )
         strengths_used = dict(strengths)
+        escalations_used = dict(rounds_used)
         _scores, remaining = run_detection(output, fps=fps, profile=profile)
         if not remaining:
             passed = True
@@ -206,7 +232,7 @@ def mitigate_with_fallback(
             end_frame=key[1],
             initial_strength=initial[key],
             final_strength=strengths_used[key],
-            rounds=rounds_used[key],
+            escalations=escalations_used[key],
             passed=not still_risky.intersection(range(key[0], key[1] + 1)),
         )
         for key in keys

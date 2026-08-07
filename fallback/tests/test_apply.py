@@ -135,7 +135,7 @@ def test_report_records_the_strength_actually_used():
     for outcome in report.segments:
         assert 0.0 < outcome.final_strength <= 1.0
         assert outcome.final_strength >= outcome.initial_strength
-        assert outcome.rounds >= 0
+        assert outcome.escalations >= 0
 
 
 def test_frames_outside_every_segment_are_bit_identical():
@@ -204,6 +204,45 @@ def test_final_strength_matches_the_strength_actually_applied():
         )
         for index in range(key[0], key[1] + 1):
             assert np.array_equal(rebuilt[index], corrected[index])
+
+
+def test_escalations_field_matches_final_strength_on_a_non_convergent_run():
+    # Regression guard: `rounds_used` (now the `escalations` field) used to
+    # be incremented unconditionally at the bottom of the escalation loop,
+    # including on the final iteration -- AFTER the last `_apply_segments`
+    # call that would ever run -- while `strengths_used` (what
+    # `final_strength` reports) was snapshotted BEFORE that increment. On a
+    # run that exhausts max_rounds without converging, that made the two
+    # fields of one SegmentOutcome disagree: `final_strength` reflected one
+    # fewer escalation than `escalations` claimed. This is exactly the
+    # record README section 7 exists to log for an incident, so it must not
+    # contradict itself.
+    frames = _flickering_clip(flicker_range=(10, 40))
+    max_rounds = 3
+    strength_step = 0.02
+    _corrected, report = mitigate_with_fallback(
+        frames, fps=20.0, profile=PROFILE, max_rounds=max_rounds, strength_step=strength_step
+    )
+
+    assert report.passed is False, "fixture must exhaust max_rounds to exercise the bug"
+    assert report.rounds == max_rounds
+    assert len(report.segments) > 0
+    for outcome in report.segments:
+        assert outcome.final_strength == pytest.approx(
+            outcome.initial_strength + outcome.escalations * strength_step, abs=1e-6
+        )
+
+
+def test_max_rounds_below_one_raises():
+    # With max_rounds=0 the escalation loop never runs: `remaining` stays
+    # `[]`, so every SegmentOutcome.passed would compute True even though the
+    # returned frames are the untouched, known-risky inputs. mitigate_with_
+    # fallback is deliberately a pure function meant to be called directly by
+    # a future escalation-ladder caller that reads per-segment `passed` --
+    # that caller is exactly who a silently-wrong verdict would mislead.
+    frames = _flickering_clip(flicker_range=(10, 40))
+    with pytest.raises(ValueError):
+        mitigate_with_fallback(frames, fps=20.0, profile=PROFILE, max_rounds=0)
 
 
 def test_segment_weights_applies_independent_margins_per_side():

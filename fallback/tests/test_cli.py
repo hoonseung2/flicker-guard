@@ -71,7 +71,7 @@ def test_cli_returns_nonzero_when_the_clip_still_fails(tmp_path, monkeypatch):
     def _fake_mitigate(frames, fps, profile, max_rounds, strength_step):
         outcome = SegmentOutcome(
             start_frame=0, end_frame=9, initial_strength=0.5,
-            final_strength=1.0, rounds=6, passed=False,
+            final_strength=1.0, escalations=6, passed=False,
         )
         return list(frames), FallbackReport(
             segments=[outcome], passed=False, rounds=6, remaining_segments=1
@@ -88,3 +88,29 @@ def test_cli_returns_nonzero_when_the_clip_still_fails(tmp_path, monkeypatch):
     ])
     assert exit_code == 1
     assert json.loads(report.read_text(encoding="utf-8"))["passed"] is False
+
+
+def test_cli_returns_two_and_writes_an_error_report_on_a_corrupt_input(tmp_path):
+    # Mirrors detector/cli.py's contract (detector/tests/test_cli.py's
+    # test_main_fails_loudly_on_corrupt_video): a decode failure must not
+    # propagate as an unhandled traceback, and it must not be reported as if
+    # nothing happened either. This is not hypothetical for this project --
+    # two of the three real measurement clips' originals decode fewer frames
+    # than their container declares and raise VideoReadError.
+    corrupt = tmp_path / "corrupt.mp4"
+    corrupt.write_bytes(b"this is definitely not an mp4 container" * 32)
+    report = tmp_path / "report.json"
+
+    exit_code = main([
+        "--input", str(corrupt),
+        "--output", str(tmp_path / "out.mp4"),
+        "--profile", "configs/profiles/itu.json",
+        "--report", str(report),
+    ])
+
+    assert exit_code == 2
+    data = json.loads(report.read_text(encoding="utf-8"))
+    assert data["status"] == "error"
+    assert "error" in data
+    assert "segments" not in data
+    assert not (tmp_path / "out.mp4").exists()
