@@ -60,12 +60,9 @@ def test_mitigate_segment_downscales_large_frames_for_bottleneck_attention(monke
     mask[100:200, 100:200] = True
     no_mask = np.zeros((h, w), dtype=bool)
     fake_priors = [
-        FramePrior(frame_index=0, target_histogram=None, mask=no_mask),
-        FramePrior(
-            frame_index=1, target_histogram=np.full(64, 1.0 / 64, dtype=np.float32),
-            mask=mask, required_strength=0.5,
-        ),
-        FramePrior(frame_index=2, target_histogram=None, mask=no_mask),
+        FramePrior(frame_index=0, mask=no_mask),
+        FramePrior(frame_index=1, mask=mask, required_strength=0.5),
+        FramePrior(frame_index=2, mask=no_mask),
     ]
     monkeypatch.setattr(infer_module, "compute_prior", lambda frames, fps, profile: fake_priors)
 
@@ -94,8 +91,8 @@ def test_mitigate_segment_passes_through_frame_on_nan_output(monkeypatch):
     # them and mitigate_segment now skips them before ever calling the
     # (patched) model.
     fake_priors = [
-        FramePrior(frame_index=0, target_histogram=None, mask=mask, required_strength=0.5),
-        *[FramePrior(frame_index=i, target_histogram=None, mask=no_mask) for i in range(1, 20)],
+        FramePrior(frame_index=0, mask=mask, required_strength=0.5),
+        *[FramePrior(frame_index=i, mask=no_mask) for i in range(1, 20)],
     ]
     monkeypatch.setattr(infer_module, "compute_prior", lambda frames, fps, profile: fake_priors)
 

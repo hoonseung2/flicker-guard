@@ -86,31 +86,6 @@ def relative_luminance_torch(frames: torch.Tensor) -> torch.Tensor:
     )
 
 
-def temporal_consistency_loss(
-    pred_a: torch.Tensor,
-    pred_b: torch.Tensor,
-    target_a: torch.Tensor,
-    target_b: torch.Tensor,
-) -> torch.Tensor:
-    """Penalise per-pixel luminance change between two consecutive frames
-    that the ground-truth pair does not have.
-
-    l1_ssim_loss scores each frame on its own, so a model that corrects
-    every frame by the same proportion scores well while leaving the
-    original flicker pattern intact at reduced amplitude -- measured on a
-    real clip as a 60% smaller brightness jump but only 12% fewer
-    transitions, which a viewer still reads as flickering at the same rate.
-
-    Comparing the prediction's frame-to-frame delta against the target's
-    (rather than driving the delta to zero) is what keeps legitimate motion:
-    a camera move or a cut appears in both, cancels, and costs nothing. Only
-    change with no counterpart in the clean pair is charged for.
-    """
-    delta_pred = relative_luminance_torch(pred_b) - relative_luminance_torch(pred_a)
-    delta_target = relative_luminance_torch(target_b) - relative_luminance_torch(target_a)
-    return (delta_pred - delta_target).abs().mean()
-
-
 def warp_by_shift(
     frames: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:

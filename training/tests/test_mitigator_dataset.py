@@ -77,10 +77,9 @@ def test_dataset_excludes_frames_outside_segments(tmp_path):
     assert len(dataset) == 0
 
 
-def test_dataset_includes_only_frames_in_segments_with_valid_target(tmp_path):
-    # fps=10 -> Detector's trailing window needs ~10 frames before it stops
-    # reporting uncertain=True, so target_histogram is None for frames
-    # 0-9ish on any clip. Frames 12-15 are past that priming window.
+def test_dataset_includes_only_frames_in_segments(tmp_path):
+    # Segment membership alone determines inclusion -- risky_indices covers
+    # frames 12-15 inclusive, so exactly those 4 frames land in the index.
     _write_fake_sample(tmp_path, "clipB", n_frames=20, fps=10.0,
                        segments=[{"start_frame": 12, "end_frame": 15}])
     split = clip_split("clipB")
@@ -96,8 +95,6 @@ def test_getitem_returns_correct_shapes(tmp_path):
     example = dataset[0]
     assert example["window"].shape == (9, 8, 8)
     assert example["mask"].shape == (1, 8, 8)
-    assert example["histogram"].shape == (64,)
-    assert example["clean"].shape == (3, 8, 8)
 
 
 def test_getitem_duplicates_boundary_frame_at_clip_end(tmp_path):
@@ -119,8 +116,8 @@ def test_getitem_duplicates_boundary_frame_at_clip_end(tmp_path):
 
 
 def test_dataset_only_retains_frame_priors_for_indexed_frames(tmp_path):
-    # Only ~10% of a real dataset's frames land in self._index (risky +
-    # has-target), so retaining every frame's FramePrior (each carrying a
+    # Only ~10% of a real dataset's frames land in self._index (the risky
+    # ones), so retaining every frame's FramePrior (each carrying a
     # full-resolution mask) for the dataset's lifetime wastes most of the
     # memory it holds. Retained priors must match self._index exactly.
     _write_fake_sample(tmp_path, "clipG", n_frames=20, h=8, w=8, fps=10.0,
@@ -153,20 +150,19 @@ def test_dataset_tracks_samples_scanned_and_contributing(tmp_path):
         assert dataset.samples_contributing == contributing
 
 
-def test_dataset_excludes_risky_frames_with_none_target_histogram(tmp_path):
-    # fps=10 -> Detector's trailing window needs ~10 frames before it stops
-    # reporting uncertain=True, so target_histogram is None for at least
-    # frames 0-9 of any clip. A segment starting at frame 0 straddles that
-    # boundary: frames inside the segment but before priming completes must
-    # be excluded even though they ARE in a risky segment, while frames
-    # after priming (still in the same segment) must be included.
+def test_dataset_includes_every_frame_of_a_segment_regardless_of_warm_up(tmp_path):
+    # Segment membership alone gates inclusion now (the retired
+    # histogram-validity gate excluded a segment's early frames until
+    # Detector's trailing window stopped reporting uncertain=True). A
+    # segment starting at frame 0 exercises exactly that boundary: frame 0
+    # must be included even though it is within Detector's warm-up window,
+    # since it is still inside the risk segment.
     _write_fake_sample(tmp_path, "clipF", n_frames=20, fps=10.0,
                        segments=[{"start_frame": 0, "end_frame": 15}])
     split = clip_split("clipF")
     dataset = MitigatorDataset(tmp_path, PROFILE, split=split)
     frame_indices = sorted(idx for _, idx in dataset._index)
-    assert 0 not in frame_indices  # inside segment, but target_histogram is None this early
-    assert 15 in frame_indices     # inside segment, past priming, target_histogram is valid
+    assert frame_indices == list(range(16))  # every frame of the segment, 0-15 inclusive
 
 
 def test_prior_cache_is_written_and_reused(tmp_path, monkeypatch):
@@ -203,7 +199,6 @@ def test_load_prior_cache_reads_each_key_only_once(tmp_path, monkeypatch):
     priors = [
         FramePrior(
             frame_index=i,
-            target_histogram=np.random.rand(64).astype(np.float32),
             mask=np.ones((8, 8), dtype=bool),
         )
         for i in range(5)
@@ -239,7 +234,7 @@ def test_load_prior_cache_reads_each_key_only_once(tmp_path, monkeypatch):
     result = _load_prior_cache(cache_path)
 
     assert len(result) == 5
-    for key in ["frame_indices", "histograms", "has_target", "masks"]:
+    for key in ["frame_indices", "masks", "required_strengths"]:
         assert call_counts.get(key) == 1, (
             f"Key '{key}' was accessed {call_counts.get(key, 0)} times, "
             f"expected 1 (indicates per-frame re-fetch bug if > 1)"
@@ -262,7 +257,7 @@ def test_dataset_raises_clear_error_when_meta_json_has_no_fps(tmp_path):
 
 
 def test_getitem_returns_a_partner_frame_for_the_temporal_loss(tmp_path):
-    # The temporal consistency term compares two consecutive restored
+    # The self-supervised temporal term compares two consecutive restored
     # frames, so one example has to carry everything needed to run the
     # model on its neighbour as well.
     _write_fake_sample(tmp_path, "clipT", n_frames=20, h=8, w=8, fps=10.0,
@@ -271,8 +266,6 @@ def test_getitem_returns_a_partner_frame_for_the_temporal_loss(tmp_path):
     example = dataset[0]
     assert example["window_partner"].shape == (9, 8, 8)
     assert example["mask_partner"].shape == (1, 8, 8)
-    assert example["histogram_partner"].shape == (64,)
-    assert example["clean_partner"].shape == (3, 8, 8)
 
 
 def test_partner_is_the_next_frame_when_it_is_also_indexed(tmp_path):
@@ -299,7 +292,7 @@ def test_partner_falls_back_to_the_frame_itself_at_a_segment_end(tmp_path):
     pos = frame_indices.index(max(frame_indices))
     example = dataset[pos]
     assert torch.equal(example["window"], example["window_partner"])
-    assert torch.equal(example["clean"], example["clean_partner"])
+    assert torch.equal(example["mask"], example["mask_partner"])
 
 
 def test_getitem_carries_the_required_strength(tmp_path):
@@ -385,8 +378,6 @@ def test_a_stale_prior_cache_is_rejected_rather_than_misread(tmp_path):
     stale = tmp_path / "prior_cache.npz"
     np.savez_compressed(
         stale,
-        has_target=np.array([True]),
-        histograms=np.zeros((1, 64), dtype=np.float32),
         masks=np.ones((1, 4, 4), dtype=bool),
         frame_indices=np.array([0], dtype=np.int64),
     )
