@@ -67,14 +67,74 @@ def test_red_flash_is_detected_without_a_luminance_change():
     assert soft_flagged_area(_to_torch(grey), _to_torch(red), PROFILE).item() > 0.5
 
 
+def test_soft_area_respects_the_darkness_condition():
+    # The general-flash test is an AND of a delta condition and a darkness
+    # condition -- transition_mask requires darker < dark_threshold too, not
+    # delta alone. This pair has plenty of delta (0.152) but both frames are
+    # bright: relative luminance goes 0.848 -> 1.0, and 0.848 sits above the
+    # 0.80 dark_threshold, so the Detector does not flag it. An
+    # implementation that dropped the darkness sigmoid and fired on delta
+    # alone would pass test_soft_area_tracks_the_detector_hard_area (its
+    # bright band always sits on a dark base) but would wrongly flag this
+    # pair.
+    prev = np.full((16, 16, 3), 0.93, dtype=np.float32)
+    curr = np.full((16, 16, 3), 1.0, dtype=np.float32)
+
+    hard = transition_mask(
+        relative_luminance(prev), relative_luminance(curr),
+        dark_threshold=PROFILE.general_flash_dark_threshold,
+        delta_threshold=PROFILE.general_flash_delta_threshold,
+    )
+    hard_area = float(hard.mean())
+    assert hard_area == 0.0  # sanity: the Detector does not flag this pair
+
+    soft = soft_flagged_area(_to_torch(prev), _to_torch(curr), PROFILE).item()
+    assert abs(soft - hard_area) < 0.15, f"soft {soft:.3f} vs hard {hard_area:.3f}"
+
+
+def test_red_xor_is_near_zero_when_both_frames_are_saturated_red():
+    # red_flash_mask is an XOR of "is saturated red" between prev and curr,
+    # not "is curr saturated red". Two frames that are both saturated red
+    # (ratios ~0.85 and ~0.95, clearly different from each other and from
+    # the grey/red pair above) but differ in exact shade must score near
+    # zero -- XOR of two trues is false. An implementation that checked
+    # only curr's saturation would flag this pair; using two distinct
+    # ratios also rules out the term merely returning zero because the
+    # frames are identical.
+    frame1 = np.zeros((8, 8, 3), dtype=np.float32)
+    frame1[..., 0] = 0.85
+    frame1[..., 1] = 0.075
+    frame1[..., 2] = 0.075
+    frame2 = np.zeros((8, 8, 3), dtype=np.float32)
+    frame2[..., 0] = 0.95
+    frame2[..., 1] = 0.025
+    frame2[..., 2] = 0.025
+
+    hard = red_flash_mask(frame1, frame2, saturation_ratio_threshold=PROFILE.red_saturation_ratio_threshold)
+    assert not hard.any()  # sanity: both are saturated red, so XOR is false
+
+    soft = soft_flagged_area(_to_torch(frame1), _to_torch(frame2), PROFILE).item()
+    assert soft < 0.15
+
+
 def test_gradients_flow_to_both_frames():
     rng = np.random.default_rng(3)
     a = _to_torch(rng.random((16, 16, 3)).astype(np.float32) * 0.3).requires_grad_(True)
     b = _to_torch(rng.random((16, 16, 3)).astype(np.float32) * 0.9).requires_grad_(True)
 
     soft_flagged_area(a, b, PROFILE).sum().backward()
-    assert torch.isfinite(a.grad).all() and a.grad.abs().sum() > 0
-    assert torch.isfinite(b.grad).all() and b.grad.abs().sum() > 0
+
+    # tau=0.02 is mandated by the spec, and it makes the general-flash
+    # sigmoid saturate within about +-0.08 of the threshold in luminance
+    # space: pixels well clear of a threshold carry a near-zero gradient
+    # even though they are technically nonzero. Measured on these inputs,
+    # ~83% of pixels carry a nonzero gradient, so "a meaningful fraction of
+    # pixels carry signal" is what this test can honestly claim -- not that
+    # every pixel does, and not just that the batch sum is positive.
+    for grad in (a.grad, b.grad):
+        assert torch.isfinite(grad).all()
+        nonzero_fraction = (grad.abs() > 0).float().mean().item()
+        assert nonzero_fraction > 0.5
 
 
 def test_valid_mask_excludes_pixels_from_the_average():
