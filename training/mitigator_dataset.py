@@ -25,6 +25,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from detector.luminance import relative_luminance
+from detector.motion import estimate_global_shift
 from detector.profiles import ThresholdProfile
 from prior.compute import DEFAULT_N_BINS, FramePrior, compute_prior
 
@@ -119,6 +121,25 @@ def _load_or_compute_prior(
     priors = compute_prior(degraded_frames, fps=fps, profile=profile)
     _save_prior_cache(cache_path, priors)
     return priors
+
+
+# Same default the Detector uses. Duplicated as a call rather than a
+# constant so the two can never drift: `estimate_global_shift` already
+# applies it, and this only asks whether it fired.
+def _shift_is_trusted(prev_luminance: np.ndarray, curr_luminance: np.ndarray) -> bool:
+    """Whether phase correlation actually locked onto structure.
+
+    `estimate_global_shift` returns (0.0, 0.0) both when the frames genuinely
+    did not move and when it refused to guess, and the loss cannot tell those
+    apart. On a rejected pan it would warp by zero and then charge the real
+    camera motion as flicker -- and unlike the Detector, which smooths a bad
+    warp through thresholding, area-averaging and a one-second windowed
+    maximum, the temporal term is a raw per-pixel L1 with no such stage.
+    """
+    _shift, response = cv2.phaseCorrelate(
+        prev_luminance.astype(np.float32), curr_luminance.astype(np.float32)
+    )
+    return response >= 0.30
 
 
 class MitigatorDataset(Dataset):
@@ -239,4 +260,18 @@ class MitigatorDataset(Dataset):
         example["histogram_partner"] = partner["histogram"]
         example["clean_partner"] = partner["clean"]
         example["strength_partner"] = partner["strength"]
+
+        if partner_index == frame_index:
+            # Self-paired at a segment's last frame: no motion by
+            # construction, and trusted precisely because it is not a guess.
+            example["shift"] = torch.zeros(2, dtype=torch.float32)
+            example["shift_trusted"] = torch.ones(1, dtype=torch.float32)
+        else:
+            centre = relative_luminance(_read_frame(sample_dir / "degraded", frame_index))
+            follower = relative_luminance(_read_frame(sample_dir / "degraded", partner_index))
+            dx, dy = estimate_global_shift(centre, follower)
+            example["shift"] = torch.tensor([dx, dy], dtype=torch.float32)
+            example["shift_trusted"] = torch.tensor(
+                [1.0 if _shift_is_trusted(centre, follower) else 0.0], dtype=torch.float32
+            )
         return example

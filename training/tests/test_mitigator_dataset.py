@@ -285,6 +285,46 @@ def test_getitem_carries_the_required_strength(tmp_path):
     assert example["strength_partner"].shape == (1,)
 
 
+def test_getitem_carries_the_shift_to_its_partner(tmp_path):
+    _write_fake_sample(tmp_path, "clipM", n_frames=20, h=16, w=16, fps=10.0,
+                       segments=[{"start_frame": 12, "end_frame": 15}])
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=clip_split("clipM"))
+    example = dataset[0]
+    assert example["shift"].shape == (2,)
+    assert example["shift_trusted"].shape == (1,)
+    assert float(example["shift_trusted"]) in (0.0, 1.0)
+
+
+def test_a_self_paired_frame_reports_no_shift(tmp_path):
+    # At a segment's last frame the partner is the frame itself, so there is
+    # no motion between them by construction. A nonzero shift there would
+    # warp a frame against itself and charge the model for the difference.
+    _write_fake_sample(tmp_path, "clipN", n_frames=20, h=16, w=16, fps=10.0,
+                       segments=[{"start_frame": 12, "end_frame": 15}])
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=clip_split("clipN"))
+    frame_indices = [idx for _, idx in dataset._index]
+    example = dataset[frame_indices.index(max(frame_indices))]
+    assert float(example["shift"][0]) == 0.0
+    assert float(example["shift"][1]) == 0.0
+
+
+def test_an_untrusted_shift_is_flagged_rather_than_silently_zeroed(tmp_path, monkeypatch):
+    # estimate_global_shift returns (0.0, 0.0) both when the frames really
+    # did not move and when it refused to guess. The loss cannot tell those
+    # apart, and on a rejected pan it would charge real camera motion as
+    # flicker -- with none of the Detector's three smoothing stages to
+    # absorb it. Measured: 33.6% of pairs rejected on one real clip.
+    import training.mitigator_dataset as dataset_module
+
+    monkeypatch.setattr(dataset_module, "estimate_global_shift", lambda a, b: (0.0, 0.0))
+    monkeypatch.setattr(dataset_module, "_shift_is_trusted", lambda a, b: False)
+
+    _write_fake_sample(tmp_path, "clipU", n_frames=20, h=16, w=16, fps=10.0,
+                       segments=[{"start_frame": 12, "end_frame": 15}])
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=clip_split("clipU"))
+    assert float(dataset[0]["shift_trusted"]) == 0.0
+
+
 def test_a_stale_prior_cache_is_rejected_rather_than_misread(tmp_path):
     # The cache stores derived arrays with no self-description. A cache
     # written before required_strength existed would otherwise load with a
