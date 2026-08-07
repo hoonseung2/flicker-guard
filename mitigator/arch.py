@@ -1,6 +1,6 @@
 """MitigatorNet: predicts a residual correction for the center frame of a
-3-frame degraded window, conditioned on a per-pixel risk mask and a target
-illumination histogram (both from prior.compute.compute_prior).
+3-frame degraded window, conditioned on a per-pixel risk mask and a
+required-strength scalar (both from prior.compute.compute_prior).
 
 Residual, not full-frame, prediction: degraded and clean frames are
 identical outside the injected/risky region by construction (DatasetSynth
@@ -19,9 +19,6 @@ from Flickerformer's published code, which ships with no LICENSE file.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-_HIST_BINS = 64
-_HIST_EMBED_CHANNELS = 16
 
 
 class _ConvBlock(nn.Module):
@@ -84,12 +81,17 @@ class _BottleneckAttention(nn.Module):
 class MitigatorNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.hist_embed = nn.Sequential(
-            nn.Linear(_HIST_BINS, 32),
-            nn.ReLU(),
-            nn.Linear(32, _HIST_EMBED_CHANNELS),
-        )
-        in_channels = 3 * 3 + 1 + _HIST_EMBED_CHANNELS  # 3 RGB frames + mask + hist embed
+        # 3 RGB frames + risk mask + required strength.
+        #
+        # The strength replaces a 64-bin illumination histogram. That
+        # histogram described what normal illumination looks like, derived
+        # from the same frame's non-masked pixels -- sound on synthetic data,
+        # where shapes are pasted onto ordinary video, but wrong on real
+        # concert footage, where inside the mask is stage lighting and
+        # outside is a dark crowd. Two different objects. It asked the model
+        # to make the lights as dark as the audience, and the model followed
+        # it to a median 14.6%.
+        in_channels = 3 * 3 + 1 + 1
         self.down1 = _Down(in_channels, 32)
         self.down2 = _Down(32, 64)
         self.down3 = _Down(64, 128)
@@ -103,12 +105,11 @@ class MitigatorNet(nn.Module):
         self,
         window: torch.Tensor,
         mask: torch.Tensor,
-        histogram: torch.Tensor,
+        strength: torch.Tensor,
     ) -> torch.Tensor:
         b, _, h, w = window.shape
-        hist_embedding = self.hist_embed(histogram)
-        hist_spatial = hist_embedding.view(b, _HIST_EMBED_CHANNELS, 1, 1).expand(-1, -1, h, w)
-        x = torch.cat([window, mask, hist_spatial], dim=1)
+        strength_spatial = strength.view(b, 1, 1, 1).expand(-1, -1, h, w)
+        x = torch.cat([window, mask, strength_spatial], dim=1)
 
         x1, skip1 = self.down1(x)
         x2, skip2 = self.down2(x1)
@@ -123,10 +124,10 @@ class MitigatorNet(nn.Module):
 def mitigate_frame(
     window: torch.Tensor,
     mask: torch.Tensor,
-    histogram: torch.Tensor,
+    strength: torch.Tensor,
     model: MitigatorNet,
 ) -> torch.Tensor:
-    delta = model(window, mask, histogram)
+    delta = model(window, mask, strength)
     center = window[:, 3:6, :, :]
     restored = center + delta
     return mask * restored + (1 - mask) * center

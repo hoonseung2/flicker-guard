@@ -58,10 +58,10 @@ def compute_losses(batch: dict, model: MitigatorNet, device: str, lambda_tempora
     n = batch["window"].shape[0]
     window = torch.cat([batch["window"], batch["window_partner"]], dim=0).to(device)
     mask = torch.cat([batch["mask"], batch["mask_partner"]], dim=0).to(device)
-    histogram = torch.cat([batch["histogram"], batch["histogram_partner"]], dim=0).to(device)
+    strength = torch.cat([batch["strength"], batch["strength_partner"]], dim=0).to(device)
     clean = torch.cat([batch["clean"], batch["clean_partner"]], dim=0).to(device)
 
-    restored = mitigate_frame(window, mask, histogram, model)
+    restored = mitigate_frame(window, mask, strength, model)
     reconstruction = l1_ssim_loss(restored, clean)
     temporal = temporal_consistency_loss(restored[:n], restored[n:], clean[:n], clean[n:])
     return {
@@ -121,7 +121,7 @@ class _PatchCollate:
 
     Window, mask, and clean are cropped with the same random offset to preserve their
     spatial alignment in the training pair (misaligned crops would produce invalid labels).
-    Histogram (non-spatial vector) is left untouched. Crop size clamps to actual H/W if smaller.
+    Strength (non-spatial scalar) is left untouched. Crop size clamps to actual H/W if smaller.
 
     A class rather than a closure because DataLoader workers started with
     the `spawn` method -- the only option on Windows -- pickle collate_fn to

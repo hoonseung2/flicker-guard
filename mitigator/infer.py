@@ -1,6 +1,6 @@
 """Evaluation-only inference wrapper: runs a Mitigator model over a
 sequence of frames, sliding a 3-frame window and conditioning each frame on
-PriorCalc's target histogram and risk mask. Not wired into any runtime
+PriorCalc's required strength and risk mask. Not wired into any runtime
 pipeline yet -- Verifier/Fallback/BufferManager integration is a separate,
 later roadmap step (see docs/superpowers/specs/2026-08-03-mitigator-design.md
 section 2). This exists so a trained checkpoint's output can be inspected
@@ -92,9 +92,9 @@ def mitigate_segment(
 
                 window = torch.from_numpy(window_proc.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
                 mask = torch.from_numpy(mask_proc[None, None, :, :]).to(device)
-                histogram = torch.from_numpy(prior.target_histogram).float().unsqueeze(0).to(device)
+                strength = torch.tensor([[prior.required_strength]], device=device)
 
-                restored = mitigate_frame(window, mask, histogram, model)
+                restored = mitigate_frame(window, mask, strength, model)
                 if not torch.isfinite(restored).all():
                     continue  # NaN/Inf from the model -- keep the original frame, never propagate garbage
                 restored_frame = restored.squeeze(0).permute(1, 2, 0).cpu().numpy()

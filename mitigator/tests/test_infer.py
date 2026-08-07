@@ -77,7 +77,7 @@ def test_mitigate_segment_passes_through_frame_on_nan_output(monkeypatch):
     # original input for that frame instead.
     import mitigator.infer as infer_module
 
-    def _nan_mitigate_frame(window, mask, histogram, model):
+    def _nan_mitigate_frame(window, mask, strength, model):
         return torch.full((1, 3, window.shape[-2], window.shape[-1]), float("nan"))
 
     monkeypatch.setattr(infer_module, "mitigate_frame", _nan_mitigate_frame)

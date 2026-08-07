@@ -15,7 +15,7 @@ class _FixedBatchDataset(torch.utils.data.Dataset):
         torch.manual_seed(0)
         self.window = torch.rand(9, h, w)
         self.mask = torch.ones(1, h, w)
-        self.histogram = torch.rand(64)
+        self.strength = torch.rand(1)
         self.clean = torch.rand(3, h, w)
         self.n = n
 
@@ -26,13 +26,13 @@ class _FixedBatchDataset(torch.utils.data.Dataset):
         return {
             "window": self.window,
             "mask": self.mask,
-            "histogram": self.histogram,
+            "strength": self.strength,
             "clean": self.clean,
             # compute_losses restores the centre frame and its temporal
             # partner together, so every example must carry both.
             "window_partner": self.window,
             "mask_partner": self.mask,
-            "histogram_partner": self.histogram,
+            "strength_partner": self.strength,
             "clean_partner": self.clean,
         }
 
@@ -167,7 +167,7 @@ class _FakeMitigatorDataset(torch.utils.data.Dataset):
     def __init__(self, *args, **kwargs):
         self.window = torch.rand(9, 8, 8)
         self.mask = torch.ones(1, 8, 8)
-        self.histogram = torch.rand(64)
+        self.strength = torch.rand(1)
         self.clean = torch.rand(3, 8, 8)
         self.samples_scanned = 1
         self.samples_contributing = 1
@@ -179,13 +179,13 @@ class _FakeMitigatorDataset(torch.utils.data.Dataset):
         return {
             "window": self.window,
             "mask": self.mask,
-            "histogram": self.histogram,
+            "strength": self.strength,
             "clean": self.clean,
             # compute_losses restores the centre frame and its temporal
             # partner together, so every example must carry both.
             "window_partner": self.window,
             "mask_partner": self.mask,
-            "histogram_partner": self.histogram,
+            "strength_partner": self.strength,
             "clean_partner": self.clean,
         }
 
@@ -249,11 +249,11 @@ class _VariableShapeMitigatorDataset(torch.utils.data.Dataset):
         return {
             "window": torch.rand(9, h, w),
             "mask": torch.ones(1, h, w),
-            "histogram": torch.rand(64),
+            "strength": torch.rand(1),
             "clean": torch.rand(3, h, w),
             "window_partner": torch.rand(9, h, w),
             "mask_partner": torch.ones(1, h, w),
-            "histogram_partner": torch.rand(64),
+            "strength_partner": torch.rand(1),
             "clean_partner": torch.rand(3, h, w),
         }
 
@@ -507,7 +507,7 @@ class _FlickeringPairDataset(torch.utils.data.Dataset):
         base = torch.rand(3, h, w) * 0.4 + 0.2
         self.clean = base
         self.mask = torch.ones(1, h, w)
-        self.histogram = torch.rand(64)
+        self.strength = torch.rand(1)
         self.dark = torch.cat([base, base, base], dim=0)
         self.bright = torch.cat([base, (base + 0.4), (base + 0.4)], dim=0)
 
@@ -517,9 +517,9 @@ class _FlickeringPairDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return {
             "window": self.dark, "mask": self.mask,
-            "histogram": self.histogram, "clean": self.clean,
+            "strength": self.strength, "clean": self.clean,
             "window_partner": self.bright, "mask_partner": self.mask,
-            "histogram_partner": self.histogram, "clean_partner": self.clean,
+            "strength_partner": self.strength, "clean_partner": self.clean,
         }
 
 
