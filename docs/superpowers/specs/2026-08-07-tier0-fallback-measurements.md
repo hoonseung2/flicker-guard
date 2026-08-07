@@ -27,6 +27,19 @@ back to its source.
   from native resolution, made for a documented machine-memory reason, not a
   silent trim.
 
+  **The effect of downscaling on the strength numbers themselves is
+  disclosed but not assessed, and it should be.** `required_strength`'s
+  quantile is taken over the per-pixel motion-compensated luminance delta
+  between consecutive frames. Downscaling to a 640px long side is a low-pass
+  operation, and it low-passes exactly those per-pixel deltas before the
+  quantile ever sees them — a hard single-pixel edge at native resolution
+  becomes a softer, spatially-averaged gradient at 640px, which can shift
+  the quantile value in either direction depending on the flash's spatial
+  structure. Every strength in this document, including the ≥0.9 values
+  discussed below, is therefore a 640px value. Whether it over- or
+  under-estimates the strength `required_strength` would compute at native
+  resolution is unknown — that comparison has not been run.
+
 - **Mean luminance / contrast measurement pathway differs by clip, and
   that matters.** For `wonbon_640.mp4` the before/after numbers are the
   `fallback/tests/test_real_footage.py` slow test's printed block — computed
@@ -50,6 +63,23 @@ back to its source.
   `detector.pipeline.run_detection` on the actual corrected arrays, not from
   a re-encoded file, in every run below).
 
+  **That caveat was scoped too narrowly above — it also bears on the
+  within-clip deltas, not just cross-clip comparisons.** Anyma's and Cera
+  Khin's before/after numbers both pass through the same `mp4v`
+  encode/decode on both ends, and the claim that this makes the
+  before-vs-after *delta* "fair" (the two encode passes' shifts cancel) is
+  asserted above, not measured — no spot check like the wonbon one was run
+  for a `mp4v`-encoded-on-both-ends pair to confirm the shifts actually
+  cancel rather than partially compound. That matters here specifically
+  because Anyma's −3.44% and Cera Khin's −3.89% are the same order of
+  magnitude as the ~4% shift the wonbon spot check measured for a single
+  encode pass. If the two encode passes on either clip do not cancel as
+  cleanly as assumed, a meaningful fraction of those two reported deltas
+  could be re-encode artifact rather than the correction's real effect.
+  Until the cancellation assumption is checked directly, Anyma's and Cera
+  Khin's luminance/contrast deltas should be read as bounded by, not clean
+  of, that ~4% pathway noise.
+
 - **Frame-0 segments.** `fallback/transfer.py`'s `trailing_reference` has one
   sample at frame 0 and two at frame 1; a segment that starts at literal
   frame 0 is being corrected against a reference the pipeline hasn't
@@ -65,13 +95,22 @@ back to its source.
 
 ## Per-clip summary
 
-| Clip | Resolution used | Segments before → after | Passed | Max `final_strength` (overall) | Max `final_strength` (excl. frame‑0 segments) | Mean luminance before → after (Δ%) | Mean contrast before → after (Δ%) |
-|---|---|---|---|---|---|---|---|
-| wonbon (원본.mp4) | 638x360 (pre-existing downscale) | 5 → 0 | True | 0.9644 (frame‑0 segment) | 0.7752 | 0.1228 → 0.1251 (**+1.87%**) | 0.1774 → 0.0838 (**−52.76%**) |
-| Anyma & Chris Avantgarde | 512x640 (downscaled this task) | 1 → 0 | True | 0.7939 (frame‑0 segment) | n/a — only segment starts at frame 0 | 0.041303 → 0.039882 (**−3.44%**) | 0.104715 → 0.098467 (**−5.97%**) |
-| Cera Khin | 360x640 (downscaled this task) | 1 → 0 | True | 0.9723 (does **not** start at frame 0) | 0.9723 | 0.050381 → 0.048419 (**−3.89%**) | 0.119031 → 0.061404 (**−48.41%**) |
+| Clip | Resolution used | Segments before → after | Frames touched (coverage) | Passed | Max `final_strength` (overall) | Max `final_strength` (excl. frame‑0 segments) | Mean luminance before → after (Δ%) | Mean contrast before → after (Δ%) |
+|---|---|---|---|---|---|---|---|---|
+| wonbon (원본.mp4) | 638x360 (pre-existing downscale) | 5 → 0 | 674 / 931 (**72.4%**) | True | 0.9644 (frame‑0 segment) | 0.7752 | 0.1228 → 0.1251 (**+1.87%**) | 0.1774 → 0.0838 (**−52.76%**) |
+| Anyma & Chris Avantgarde | 512x640 (downscaled this task) | 1 → 0 | 46 / 1081 (**4.3%**) | True | 0.7939 (frame‑0 segment) | n/a — only segment starts at frame 0 | 0.041303 → 0.039882 (**−3.44%**) | 0.104715 → 0.098467 (**−5.97%**) |
+| Cera Khin | 360x640 (downscaled this task) | 1 → 0 | 228 / 507 (**45.0%**) | True | 0.9723 (does **not** start at frame 0) | 0.9723 | 0.050381 → 0.048419 (**−3.89%**) | 0.119031 → 0.061404 (**−48.41%**) |
 
 All three clips passed re-validation (`report.passed is True`, `remaining_segments == 0`) — 3/3.
+
+**Coverage matters for reading the luminance column above.** These are
+whole-clip means, but Tier 0 only ever touches the risk segment(s), so the
+mean dilutes each clip's real within-segment change by the fraction of
+frames left untouched. Anyma's whole-clip −3.44% comes from a correction
+applied to only 4.3% of its frames — the other 95.7% contribute exactly 0 to
+that delta. The whole-clip number is not a fair read of how hard the
+correction hit the frames it actually touched; see the comparison section
+below for why contrast, not luminance, is the honest cost figure regardless.
 
 Sources: wonbon row from `python -m pytest fallback/tests/test_real_footage.py -m slow -v -s` (printed block reproduced below); Anyma/Cera segment and pass/fail data from `test_mp4/out/tier0_anyma.json` and `test_mp4/out/tier0_cera.json` (produced by `fallback.cli`); Anyma/Cera luminance/contrast from the streaming pass described above.
 
@@ -114,25 +153,82 @@ Observations:
   the fixed `strength_step = 0.1`); the other 3 converged on the analytic
   estimate with zero escalations. No segment needed more than one
   escalation and none exhausted `max_rounds` (6).
-- Every segment that *did* need an escalation needed exactly `+0.1` — the
-  estimate's error, where it exists, was consistently one step, not
-  scattered across a wider range, in this sample.
+- The estimate's error is ≤ 0.1 in 7 of 7 cases. Note that this is a weaker
+  claim than it sounds: `strength_step = 0.1` is the *only* step size the
+  escalation loop tried in this sample, so "every miss was one step" cannot
+  by itself distinguish a tightly-bounded estimation error from a loosely
+  bounded one — a segment whose true requirement was 0.35 above the estimate
+  would also show up as "needed escalations" without revealing how many
+  steps it actually took to discover, since the loop stops as soon as the
+  Detector passes. A step size smaller than 0.1 (e.g. the 0.02 recommended
+  below for the Cera Khin bisection) is needed before "the estimate's error
+  is small" can be claimed with any precision finer than one decimal place.
 
 ## Comparison against All-In-One-Deflicker
 
 On the same three clips, All-In-One-Deflicker (the neural-atlas method used
 as the pre-existing reference in this project) was measured earlier to cost
 −21% mean luminance on 원본, −35% on Anyma, and −35% on Cera Khin, and it
-cleared the Detector on only 2 of the 3 clips. Tier 0's measured cost on the
-same clips is +1.87% (wonbon/원본), −3.44% (Anyma), and −3.89% (Cera Khin) —
-one to two orders of magnitude smaller in every case, in one case (wonbon)
-even landing on the opposite sign — and it passed 3 of 3, including the clip
-All-In-One-Deflicker failed to clear. Tier 0 costs substantially less mean
-luminance than All-In-One-Deflicker on every clip measured, and it is more
-reliable at actually clearing the Detector. This is the expected outcome of
-touching only flagged segments instead of the whole clip (see `fallback/apply.py`'s
-module docstring), not a surprise, but it is now a measured one rather than
-an assumption.
+cleared the Detector on only 2 of the 3 clips. **Those All-In-One-Deflicker
+figures trace only to an assertion in this project's earlier notes** — there
+is no recorded run of All-In-One-Deflicker in this repository to point to,
+and the resolution it was measured at is not stated. They are quoted here
+because they are the only reference numbers available, not because they have
+been independently verified; treat the comparison below as directional, not
+exact.
+
+Tier 0's measured whole-clip mean-luminance cost on the same clips is +1.87%
+(wonbon/원본), −3.44% (Anyma), and −3.89% (Cera Khin). Taking the ratio of
+each All-In-One-Deflicker figure to Tier 0's on the same clip gives 11.2×
+(원본: 21/1.87), 10.2× (Anyma: 35/3.44), and 9.0× (Cera Khin: 35/3.89) — this
+is **roughly one order of magnitude smaller, not "one to two orders of
+magnitude"** as an earlier draft of this section claimed; 9–11× is a single
+order of magnitude. Tier 0 also passed 3 of 3 on the Detector, including the
+clip All-In-One-Deflicker failed to clear.
+
+Two further corrections to how that ratio should be read:
+
+1. **The luminance figures are diluted by coverage, not just gentler by
+   design.** All-In-One-Deflicker corrects the whole clip; Tier 0 corrects
+   only the risk segment(s) — 72.4% of wonbon's frames, 4.3% of Anyma's, and
+   45.0% of Cera Khin's (see the coverage column above). Anyma's whole-clip
+   −3.44% is therefore mostly zero contribution from the 95.7% of frames
+   Tier 0 never touched, diluting whatever the correction did to the 4.3% it
+   did touch — that is 96% dilution, not evidence the correction itself was
+   gentle. The 11.2×/10.2×/9.0× ratios above compare a whole-clip cost
+   against a *partial-clip* cost, which flatters Tier 0 on any clip where
+   its risk segments are a small share of the frames (Anyma most severely).
+   A within-segment mean-luminance delta, or an All-In-One-Deflicker number
+   measured only over the same frame ranges, would be the apples-to-apples
+   comparison; neither has been computed here.
+
+2. **Mean luminance is close to the wrong statistic to compare on at all,
+   by construction.** `compress_contrast` compresses every pixel toward the
+   segment's trailing luminance mean (design section 2.1) — that is
+   specifically a transform that is near mean-*preserving*, not one that
+   happens to score well on a mean-luminance metric. wonbon's own number
+   demonstrates this directly: its mean luminance *increased* by 1.87%
+   rather than decreasing, because compression pulled dark flash troughs up
+   toward the mean as often as it pulled bright peaks down. A method that is
+   near-invariant on a statistic by construction will always look
+   inexpensive on that statistic, independent of how much it actually
+   altered the footage. **Contrast (standard deviation) is the honest cost
+   figure for this transform**, and it is not small: −52.76% for wonbon and
+   −48.41% for Cera Khin (Anyma is milder at −5.97%, consistent with its
+   correction touching only 4.3% of frames). Those numbers are already in
+   the per-clip table above but were absent from this comparison paragraph
+   in the original draft — a reader who stopped at the luminance figures
+   would have concluded Tier 0's cost is uniformly tiny, when for two of the
+   three clips it is compressing contrast by roughly half within the
+   segments it touches.
+
+Net: Tier 0 is still the only method of the two that clears the Detector on
+all three clips, and its whole-clip mean-luminance cost is genuinely far
+smaller than All-In-One-Deflicker's reported figures. But "far smaller" is
+partly a coverage artifact and partly a statistic this transform cannot
+score badly on by construction; the contrast numbers, not the luminance
+ratio, are the number to carry into any comparison against the neural
+Mitigator's own cost.
 
 ## Verdict on design section 6's threshold question
 
@@ -141,25 +237,67 @@ or above 0.9 — if so, that is a signal the detection profile itself, not
 just Tier 0, warrants review, because a strength that high is compressing
 the segment to near-uniform output to clear the bar.
 
-**Yes, this threshold was crossed, and by a segment where it can't be
-explained away as a frame-0 warm-up artifact.** Cera Khin's only segment
-(279–506, which does not start at frame 0) needed `final_strength = 0.9723`
-to pass. Wonbon's frame-0 segment also crossed it, at 0.9644, but per the
-method note above that segment's elevated strength is confounded with the
-`trailing_reference` warm-up limitation and is weaker evidence on its own.
-Cera Khin's is not confounded that way — it is a genuine, non-frame-0
-segment demanding compression to within 0.028 of full identity-to-reference
-collapse. Excluding frame-0 segments entirely, the maximum `final_strength`
-across all three clips is still 0.9723 (Cera Khin), comfortably above the
-0.9 line. The recommendation from design section 6 stands: the ITU profile's
-flagged-area/flash-rate thresholds should be reviewed, because near-uniform
-output is what the bar is currently demanding on at least one real clip.
+**This conclusion is not yet established, and an earlier draft of this
+section overstated it.** Cera Khin's only segment (279–506, which does not
+start at frame 0) needed `final_strength = 0.9723` to pass — but
+`final_strength` is not the segment's true minimum passing strength; it is
+that minimum rounded *up* to the nearest multiple of `strength_step = 0.1`
+by the escalation loop (design section 4). The loop stops the instant the
+Detector passes, so it never checks whether
+anything below the value that passed would also have worked. All this
+number establishes is that Cera Khin's true minimum passing strength lies
+somewhere in the interval **(0.8723, 0.9723]** — and 0.88, comfortably below
+the 0.9 threshold this conclusion turns on, is inside that interval and has
+not been ruled out.
+
+Two further, independent sources of inflation compound this, both already
+described in design section 2.3 and `fallback/strength.py`'s docstring but
+not previously connected to the 0.9 verdict:
+
+1. **`required_strength` takes the max over frame pairs across the whole
+   segment.** Cera Khin's segment is 228 frames (279–506) at 30 fps — 7.6
+   seconds. The reported strength is driven entirely by whichever single
+   frame pair in those 7.6 seconds had the worst motion-compensated delta
+   quantile; every other pair in the segment needed less.
+2. **That single worst-pair value is then applied uniformly to the entire
+   7.6-second segment** (`fallback/apply.py`'s `_apply_segments`), not just
+   to the frames near the worst pair. Milder pairs elsewhere in the segment
+   are over-corrected as a direct consequence.
+
+Each of these three effects (quantization, max-over-pairs, uniform
+application of that max) pushes the reported 0.9723 upward relative to what
+a more targeted or finer-grained method would need. None of them has been
+measured, so their combined size is unknown — they could be small, or they
+could be enough to put Cera Khin's real difficulty comfortably under 0.9.
+
+**This does not mean the observation should be discarded — it means it is
+not yet a finding.** 0.9723 is a real number this branch measured on real
+footage, and a value that high, even as an upper bound, is still notable.
+But "the ITU profile's thresholds warrant review" is a conclusion that
+should follow evidence, not precede it, and right now the evidence only
+supports "somewhere in (0.8723, 0.9723], possibly below 0.9." The
+recommended next step is a bisection search on Cera Khin's segment 279–506
+at `strength_step = 0.02` (five times finer than the 0.1 used here) to
+narrow that interval before anyone treats the ≥0.9 threshold as crossed and
+acts on it.
 
 ## Test suite
 
 `pytest.ini` now registers the `slow` marker and defaults to `-m "not slow"`.
 
-- Default run: `python -m pytest -q` → `281 passed, 1 deselected` (base
-  suite of 281 unchanged, plus the new slow test correctly excluded).
+- Default run at the time these numbers were measured: `python -m pytest -q`
+  → `281 passed, 1 deselected` (base suite of 281 unchanged, plus the new
+  slow test correctly excluded).
 - Slow run: `python -m pytest fallback/tests/test_real_footage.py -m slow -v -s`
   → `1 passed in 345.01s (0:05:45)`.
+- **Post-fix-wave update (2026-08-07, this document's own correction pass):**
+  the code fixes above (`SegmentOutcome.rounds` → `escalations` and its
+  snapshot bug, the `max_rounds < 1` guard, `fallback/cli.py`'s
+  `VideoReadError` handling) added 3 regression tests. Targeted run:
+  `python -m pytest fallback/tests/test_apply.py fallback/tests/test_cli.py
+  detector/tests -v` → `89 passed`. Default run: `python -m pytest -q` →
+  `284 passed, 1 deselected`. The slow real-footage test was not re-run for
+  this pass (machine was decoding video for another process at the time;
+  see this fix wave's report) — the wonbon numbers above are unchanged from
+  the original measurement run and have not been re-verified against the
+  renamed/fixed fields.
