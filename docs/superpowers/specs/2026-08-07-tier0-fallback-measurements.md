@@ -281,6 +281,51 @@ at `strength_step = 0.02` (five times finer than the 0.1 used here) to
 narrow that interval before anyone treats the ≥0.9 threshold as crossed and
 acts on it.
 
+### Resolved: the bisection was run, and 0.9 is not crossed
+
+Run on `test_mp4/cera_640.mp4` (507 frames, 360x640, 30 fps, segment
+279–506) by calling `_apply_segments` at a fixed strength and re-running
+`run_detection` over the whole clip at each step — the same pass/fail test
+the escalation loop uses:
+
+```
+s=0.980 -> PASS   (upper anchor)
+s=0.800 -> FAIL   (lower anchor)
+s=0.890 -> PASS
+s=0.845 -> FAIL
+s=0.867 -> FAIL
+s=0.879 -> PASS
+
+minimum passing strength lies in (0.867, 0.879]
+```
+
+**The true minimum is 0.879, not 0.9723.** The ≥0.9 threshold is not
+crossed, and the "the ITU profile's thresholds warrant review" observation
+is withdrawn: this clip clears the ITU bar below 0.9, so nothing here
+argues the profile is unachievable. The suggestion may be revived only on
+new evidence, not on this measurement.
+
+Two consequences follow, and they matter more than the withdrawal.
+
+**The analytic estimate was accurate to 0.007, not 0.1.** `required_strength`
+predicted 0.8723; the true minimum is 0.879. The entire 0.093 gap between
+the estimate and the reported 0.9723 came from the escalation step size —
+0.8723 failed by a hair, and the loop's only available response was to add
+a full 0.1. The "error ≤ 0.1 in 7 of 7 cases" statement above is therefore
+not just circular but badly pessimistic on at least this segment; the
+closed-form estimate is far better than this branch's own numbers suggest.
+
+**Tier 0 therefore over-corrected this clip by roughly 9 percentage points
+of strength.** It applied 0.9723 where 0.879 would have passed, destroying
+contrast that the threshold never demanded — on 45% of the clip's frames.
+`strength_step` is a plain CLI argument, so lowering it to 0.02 costs only
+extra detection passes (each round is one `run_detection` over the clip)
+and buys a strictly gentler correction. That trade should be measured
+before Tier 0 is used for anything beyond measurement; the current 0.1
+default was chosen for convergence speed, with no evidence about its
+damage cost, and this measurement is the first evidence that the cost is
+real.
+
 ## Test suite
 
 `pytest.ini` now registers the `slow` marker and defaults to `-m "not slow"`.
