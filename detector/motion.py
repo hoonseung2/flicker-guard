@@ -32,8 +32,10 @@ def estimate_global_shift(
     Args:
         prev_gray: Previous frame as (H, W) float32 grayscale array.
         curr_gray: Current frame as (H, W) float32 grayscale array.
-        min_response: Reject the estimate below this peak height. Pass 0.0
-            to take the raw estimate regardless.
+        min_response: Reject the estimate below this peak height. A
+            non-positive value (e.g. 0.0) disables the guard entirely and
+            returns the raw estimate regardless of response, including when
+            the response itself is negative.
 
     Returns:
         Tuple of (dx, dy) representing pixel shift in x and y directions.
@@ -41,7 +43,7 @@ def estimate_global_shift(
     (dx, dy), response = cv2.phaseCorrelate(
         prev_gray.astype(np.float32), curr_gray.astype(np.float32)
     )
-    if response < min_response:
+    if min_response > 0.0 and response < min_response:
         return 0.0, 0.0
     return dx, dy
 

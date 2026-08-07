@@ -70,3 +70,25 @@ def test_min_response_zero_restores_the_unguarded_behaviour():
     b = rng.random((128, 128)).astype(np.float32)
 
     assert estimate_global_shift(a, b, min_response=0.0) != (0.0, 0.0)
+
+
+def test_min_response_zero_passes_through_a_negative_response(monkeypatch):
+    # None of the fixture seeds above produce a negative phaseCorrelate
+    # response (seeds 1, 2, 3 measure 0.0319, 0.0059, 0.0016 -- all
+    # positive), yet real footage does: the measurement that motivated this
+    # guard recorded -0.000. `response < min_response` with min_response=0.0
+    # would still fire on a negative response and silently filter it, which
+    # would censor the distribution a later diagnostic (Task 5) needs to see
+    # in full. Monkeypatch cv2.phaseCorrelate to force a negative response,
+    # since no seed hunt can guarantee one.
+    import detector.motion as motion
+
+    def fake_phase_correlate(prev, curr):
+        return (7.0, -3.0), -0.5
+
+    monkeypatch.setattr(motion.cv2, "phaseCorrelate", fake_phase_correlate)
+
+    prev = np.zeros((128, 128), dtype=np.float32)
+    curr = np.zeros((128, 128), dtype=np.float32)
+
+    assert estimate_global_shift(prev, curr, min_response=0.0) == (7.0, -3.0)
