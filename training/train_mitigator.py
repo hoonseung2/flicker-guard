@@ -67,13 +67,24 @@ def compute_batch_losses(
     Both go through the model in one concatenated forward pass -- same
     arithmetic, one kernel launch sequence.
 
-    An example whose `shift_trusted` is 0 has both motion-dependent terms
-    zeroed. `estimate_global_shift` returns (0, 0) both when the frames
-    genuinely did not move and when it refused to guess, and on a rejected
-    pan the temporal and risk terms would charge real camera motion as
-    flicker. The Detector absorbs a bad warp through thresholding,
-    area-averaging and a one-second windowed maximum; this loss has none of
-    those stages. Measured: 33.6% of frame pairs rejected on one real clip.
+    An example whose `shift_trusted` is 0 contributes exactly zero to the
+    two motion-dependent terms (`temporal`, `risk`) and to `soft_area`.
+    `estimate_global_shift` returns (0, 0) both when the frames genuinely
+    did not move and when it refused to guess, and on a rejected pan those
+    terms would otherwise charge real camera motion as flicker. The
+    Detector absorbs a bad warp through thresholding, area-averaging and a
+    one-second windowed maximum; this loss has none of those stages.
+    Measured: 33.6% of frame pairs rejected on one real clip.
+
+    The gating happens INSIDE self_supervised_loss, via its `weights`
+    argument, per item -- not as a single scalar multiplied onto the
+    already batch-averaged terms. A batch-wide scalar (`trusted.mean()`)
+    was tried first and rejected: it still lets an untrusted item's raw
+    value leak into the average at reduced weight instead of zeroing it,
+    and it shrinks a trusted item's contribution depending on how many
+    untrusted items happen to share its batch -- neither of which is what
+    "zeroed" means. Passing per-item weights into the loss's own per-item
+    reduction is what actually delivers both properties.
     """
     n = batch["window"].shape[0]
     window = torch.cat([batch["window"], batch["window_partner"]], dim=0).to(device)
@@ -91,17 +102,20 @@ def compute_batch_losses(
     terms = self_supervised_loss(
         out_a, out_b, in_a, in_b, shift[:, 0], shift[:, 1], profile,
         lambda_temporal=lambda_temporal, lambda_risk=lambda_risk,
-        tau=tau, tau_area=tau_area,
+        tau=tau, tau_area=tau_area, weights=trusted,
     )
 
-    gate = trusted.mean()
     return {
-        "loss": terms["fidelity"] + gate * (lambda_temporal * terms["temporal"]
-                                            + lambda_risk * terms["risk"]),
+        "loss": terms["loss"],
         "fidelity": terms["fidelity"],
-        "temporal": gate * terms["temporal"],
-        "risk": gate * terms["risk"],
+        "temporal": terms["temporal"],
+        "risk": terms["risk"],
         "soft_area": terms["soft_area"],
+        # Not folded into "loss" -- purely so the caller (evaluate/main) can
+        # report how much of a batch/epoch had a usable shift estimate,
+        # since soft_area (and temporal/risk) silently read as 0 for a
+        # fully-untrusted batch and that 0 needs context to interpret.
+        "trusted_fraction": trusted.mean(),
     }
 
 
@@ -153,7 +167,10 @@ def evaluate(
     tau_area: float = 0.05,
 ) -> dict:
     model.eval()
-    totals = {"loss": 0.0, "fidelity": 0.0, "temporal": 0.0, "risk": 0.0, "soft_area": 0.0}
+    totals = {
+        "loss": 0.0, "fidelity": 0.0, "temporal": 0.0, "risk": 0.0,
+        "soft_area": 0.0, "trusted_fraction": 0.0,
+    }
     n_batches = 0
     with torch.no_grad():
         for batch in dataloader:
@@ -258,8 +275,22 @@ def main(argv: list[str] | None = None) -> int:
              "not a driver: at tau=0.02 strongly-flagged pixels sit deep in "
              "sigmoid saturation.",
     )
-    parser.add_argument("--tau", type=float, default=0.02)
-    parser.add_argument("--tau-area", type=float, default=0.05)
+    parser.add_argument(
+        "--tau", type=float, default=0.02,
+        help="Softness of the flagged-pixel sigmoid used for temporal/risk/soft_area. "
+             "Smaller sharpens it toward the Detector's hard threshold (more faithful, "
+             "but a smaller gradient region around the threshold); larger relaxes it "
+             "(more gradient signal, but the soft flagged-pixel test diverges further "
+             "from the hard rule this loss is trying to satisfy).",
+    )
+    parser.add_argument(
+        "--tau-area", type=float, default=0.05,
+        help="Softness of the risk term's softplus around max_area_ratio. Smaller "
+             "makes risk behave more like a hard cutoff at the limit (near-zero "
+             "gradient until the limit is almost reached); larger spreads the pull "
+             "toward headroom further below the limit, at the cost of penalising "
+             "already-compliant frames too.",
+    )
     parser.add_argument("--log-path")
     parser.add_argument("--patch-size", type=int, default=None,
                         help="Optional: random crop to this spatial size (e.g. 256) for VRAM-limited training on local GPUs. "
@@ -377,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
                 "val_temporal": val_metrics["temporal"],
                 "val_risk": val_metrics["risk"],
                 "val_soft_area": val_metrics["soft_area"],
+                "val_trusted_fraction": val_metrics["trusted_fraction"],
                 "lambda_temporal": args.lambda_temporal,
                 "lambda_risk": args.lambda_risk,
                 "tau": args.tau,
@@ -388,10 +420,15 @@ def main(argv: list[str] | None = None) -> int:
         # is buying flicker suppression with picture fidelity, and the
         # combined number alone would hide which way that trade is going.
         # There is no PSNR line -- it compared against a clean reference,
-        # and this objective no longer has one.
+        # and this objective no longer has one. trusted_fraction is printed
+        # alongside soft_area because soft_area (like temporal/risk) is
+        # averaged over trusted examples only -- a low fraction means that
+        # epoch's soft_area rests on few examples, which the number alone
+        # would not reveal.
         print(f"epoch {epoch}: train_loss={train_loss:.4f} val_loss={val_metrics['loss']:.4f} "
               f"(fidelity={val_metrics['fidelity']:.4f} temporal={val_metrics['temporal']:.4f} "
-              f"risk={val_metrics['risk']:.4f} soft_area={val_metrics['soft_area']:.4f}) "
+              f"risk={val_metrics['risk']:.4f} soft_area={val_metrics['soft_area']:.4f} "
+              f"trusted_fraction={val_metrics['trusted_fraction']:.4f}) "
               f"({elapsed:.1f}s)")
 
     return 0

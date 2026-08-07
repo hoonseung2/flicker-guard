@@ -22,7 +22,6 @@ class _FixedBatchDataset(torch.utils.data.Dataset):
         self.window = torch.rand(9, h, w)
         self.mask = torch.ones(1, h, w)
         self.strength = torch.rand(1)
-        self.clean = torch.rand(3, h, w)
         self.n = n
 
     def __len__(self):
@@ -33,13 +32,11 @@ class _FixedBatchDataset(torch.utils.data.Dataset):
             "window": self.window,
             "mask": self.mask,
             "strength": self.strength,
-            "clean": self.clean,
             # compute_batch_losses restores the centre frame and its temporal
             # partner together, so every example must carry both.
             "window_partner": self.window,
             "mask_partner": self.mask,
             "strength_partner": self.strength,
-            "clean_partner": self.clean,
             # Required by compute_batch_losses's self-supervised loss --
             # zero shift, trusted, so the motion-dependent terms are live.
             "shift": torch.zeros(2),
@@ -178,7 +175,6 @@ class _FakeMitigatorDataset(torch.utils.data.Dataset):
         self.window = torch.rand(9, 8, 8)
         self.mask = torch.ones(1, 8, 8)
         self.strength = torch.rand(1)
-        self.clean = torch.rand(3, 8, 8)
         self.samples_scanned = 1
         self.samples_contributing = 1
 
@@ -190,13 +186,11 @@ class _FakeMitigatorDataset(torch.utils.data.Dataset):
             "window": self.window,
             "mask": self.mask,
             "strength": self.strength,
-            "clean": self.clean,
             # compute_batch_losses restores the centre frame and its temporal
             # partner together, so every example must carry both.
             "window_partner": self.window,
             "mask_partner": self.mask,
             "strength_partner": self.strength,
-            "clean_partner": self.clean,
             "shift": torch.zeros(2),
             "shift_trusted": torch.ones(1),
         }
@@ -221,7 +215,7 @@ def test_main_resume_does_not_clobber_best_pt_with_worse_checkpoint(tmp_path, mo
                         lambda_risk=1.0, tau=0.02, tau_area=0.05):
         return {
             "loss": next(scripted_losses), "fidelity": 0.0, "temporal": 0.0,
-            "risk": 0.0, "soft_area": 0.0,
+            "risk": 0.0, "soft_area": 0.0, "trusted_fraction": 1.0,
         }
 
     monkeypatch.setattr(train_mitigator_module, "evaluate", _fake_evaluate)
@@ -266,11 +260,9 @@ class _VariableShapeMitigatorDataset(torch.utils.data.Dataset):
             "window": torch.rand(9, h, w),
             "mask": torch.ones(1, h, w),
             "strength": torch.rand(1),
-            "clean": torch.rand(3, h, w),
             "window_partner": torch.rand(9, h, w),
             "mask_partner": torch.ones(1, h, w),
             "strength_partner": torch.rand(1),
-            "clean_partner": torch.rand(3, h, w),
             "shift": torch.zeros(2),
             "shift_trusted": torch.ones(1),
         }
@@ -312,7 +304,7 @@ def test_train_one_epoch_raises_clearly_on_nan_loss(monkeypatch):
 
     def _nan_self_supervised_loss(out_a, out_b, in_a, in_b, dx, dy, profile,
                                    lambda_temporal=1.0, lambda_risk=1.0,
-                                   tau=0.02, tau_area=0.05):
+                                   tau=0.02, tau_area=0.05, weights=None):
         nan = torch.tensor(float("nan"))
         return {"loss": nan, "fidelity": nan, "temporal": nan, "risk": nan, "soft_area": nan}
 
@@ -520,13 +512,12 @@ def test_patch_collate_crops_partner_tensors_with_the_same_offset():
 
 
 class _FlickeringPairDataset(torch.utils.data.Dataset):
-    """A pair whose clean frames are identical but whose degraded frames
-    differ in brightness -- i.e. pure flicker, nothing else."""
+    """A pair built from one shared base frame, degraded into a dark centre
+    frame and a bright partner -- i.e. pure flicker, nothing else."""
 
     def __init__(self, h=16, w=16):
         torch.manual_seed(0)
         base = torch.rand(3, h, w) * 0.4 + 0.2
-        self.clean = base
         self.mask = torch.ones(1, h, w)
         self.strength = torch.rand(1)
         self.dark = torch.cat([base, base, base], dim=0)
@@ -538,17 +529,17 @@ class _FlickeringPairDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return {
             "window": self.dark, "mask": self.mask,
-            "strength": self.strength, "clean": self.clean,
+            "strength": self.strength,
             "window_partner": self.bright, "mask_partner": self.mask,
-            "strength_partner": self.strength, "clean_partner": self.clean,
+            "strength_partner": self.strength,
             "shift": torch.zeros(2), "shift_trusted": torch.ones(1),
         }
 
 
 def test_lambda_temporal_and_risk_zero_reduces_to_fidelity_only():
     # With both motion-dependent weights at 0, compute_batch_losses's "loss"
-    # collapses to the fidelity term alone -- fidelity + gate * (0 * temporal
-    # + 0 * risk) == fidelity, regardless of the gate.
+    # collapses to the fidelity term alone -- fidelity + 0 * temporal
+    # + 0 * risk == fidelity.
     from training.train_mitigator import compute_batch_losses
 
     model = MitigatorNet()
@@ -645,7 +636,7 @@ def test_evaluate_reports_every_loss_term():
     profile = load_profile(Path("configs/profiles/itu.json"))
 
     metrics = evaluate(model, loader, device="cpu", profile=profile)
-    for key in ("loss", "fidelity", "temporal", "risk", "soft_area"):
+    for key in ("loss", "fidelity", "temporal", "risk", "soft_area", "trusted_fraction"):
         assert key in metrics
 
 
@@ -665,3 +656,105 @@ def test_an_untrusted_shift_drops_the_temporal_and_risk_terms():
     assert terms["temporal"].item() == pytest.approx(0.0, abs=1e-6)
     assert terms["risk"].item() == pytest.approx(0.0, abs=1e-6)
     assert terms["fidelity"].item() > 0.0 or terms["loss"].item() >= 0.0
+
+
+class _DistinctPairDataset(torch.utils.data.Dataset):
+    """A flickering pair whose content is seed-distinguishable from any
+    other instance of this class -- lets a test tell whether one item's
+    computed terms leaked information from a different item sharing its
+    batch."""
+
+    def __init__(self, seed, h=16, w=16):
+        g = torch.Generator().manual_seed(seed)
+        dark = torch.rand(3, h, w, generator=g) * 0.2
+        bright = (dark + 0.7).clamp(0, 1)
+        self.window = torch.cat([dark, dark, bright], dim=0)
+        self.window_partner = torch.cat([dark, bright, bright], dim=0)
+        self.mask = torch.ones(1, h, w)
+        self.strength = torch.tensor([0.6])
+
+    def item(self, shift_trusted: float) -> dict:
+        return {
+            "window": self.window, "mask": self.mask, "strength": self.strength,
+            "window_partner": self.window_partner, "mask_partner": self.mask,
+            "strength_partner": self.strength,
+            "shift": torch.zeros(2), "shift_trusted": torch.tensor([shift_trusted]),
+        }
+
+
+def test_a_trusted_items_terms_do_not_depend_on_an_untrusted_batchmate():
+    # Important-1 fix (code review, round 1): the trust gate used to be a
+    # single batch-wide scalar (trusted.mean()) multiplied onto terms that
+    # self_supervised_loss had ALREADY averaged across the batch. That both
+    # let the untrusted item's raw value leak into the average at reduced
+    # weight (never truly zeroed) and shrank the trusted item's own
+    # contribution depending on how many untrusted items happened to share
+    # its batch. The fix moves the gating inside self_supervised_loss, as a
+    # per-item weight applied before the batch reduction -- this pins the
+    # property that fix must deliver: a trusted item's temporal/risk in a
+    # mixed batch must be bit-for-bit what it would be alone.
+    #
+    # MitigatorNet uses GroupNorm(1, ...), which normalises each sample
+    # independently (no cross-sample statistics like BatchNorm), so the
+    # model's own output for one item is unaffected by what else is in its
+    # batch -- any difference here can only come from the loss reduction.
+    from training.train_mitigator import compute_batch_losses
+
+    model = MitigatorNet()
+    profile = load_profile(Path("configs/profiles/itu.json"))
+
+    trusted_item = _DistinctPairDataset(seed=1).item(shift_trusted=1.0)
+    untrusted_item = _DistinctPairDataset(seed=2).item(shift_trusted=0.0)
+
+    alone = compute_batch_losses(
+        torch.utils.data.default_collate([trusted_item]), model, "cpu", profile,
+    )
+    mixed = compute_batch_losses(
+        torch.utils.data.default_collate([trusted_item, untrusted_item]), model, "cpu", profile,
+    )
+
+    assert mixed["temporal"].item() == pytest.approx(alone["temporal"].item(), abs=1e-5)
+    assert mixed["risk"].item() == pytest.approx(alone["risk"].item(), abs=1e-5)
+
+
+def test_soft_area_matches_alone_and_trusted_fraction_reports_the_mix():
+    # Important-2 fix (code review, round 1): soft_area was reported
+    # ungated -- an operator reading val_soft_area could not tell how much
+    # of it rested on rejected (mis-warped) pairs. Fixed the same way as
+    # temporal/risk: gated per item inside self_supervised_loss, plus a new
+    # trusted_fraction key so the operator can see how much of the batch
+    # that number actually rests on.
+    from training.train_mitigator import compute_batch_losses
+
+    model = MitigatorNet()
+    profile = load_profile(Path("configs/profiles/itu.json"))
+
+    trusted_item = _DistinctPairDataset(seed=1).item(shift_trusted=1.0)
+    untrusted_item = _DistinctPairDataset(seed=2).item(shift_trusted=0.0)
+
+    alone = compute_batch_losses(
+        torch.utils.data.default_collate([trusted_item]), model, "cpu", profile,
+    )
+    mixed = compute_batch_losses(
+        torch.utils.data.default_collate([trusted_item, untrusted_item]), model, "cpu", profile,
+    )
+
+    assert mixed["soft_area"].item() == pytest.approx(alone["soft_area"].item(), abs=1e-5)
+    assert mixed["trusted_fraction"].item() == pytest.approx(0.5, abs=1e-6)
+
+
+def test_soft_area_and_trusted_fraction_are_zero_when_nothing_is_trusted():
+    # Dividing by zero trusted examples must report 0.0, not NaN or a
+    # division blow-up -- and trusted_fraction=0.0 is what tells the
+    # operator that the 0.0 soft_area means "no usable data," not "no
+    # flagged pixels."
+    from training.train_mitigator import compute_batch_losses
+
+    model = MitigatorNet()
+    profile = load_profile(Path("configs/profiles/itu.json"))
+    batch = torch.utils.data.default_collate([_SelfSupervisedBatchDataset()[0]])
+    batch["shift_trusted"] = torch.zeros(1, 1)
+
+    terms = compute_batch_losses(batch, model, "cpu", profile)
+    assert terms["soft_area"].item() == pytest.approx(0.0, abs=1e-6)
+    assert terms["trusted_fraction"].item() == pytest.approx(0.0, abs=1e-6)
