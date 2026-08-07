@@ -7,6 +7,8 @@ that adding a new dependency isn't worth it.
 import torch
 import torch.nn.functional as F
 
+from detector.profiles import ThresholdProfile
+
 _C1 = 0.01 ** 2
 _C2 = 0.03 ** 2
 
@@ -107,3 +109,136 @@ def temporal_consistency_loss(
     delta_pred = relative_luminance_torch(pred_b) - relative_luminance_torch(pred_a)
     delta_target = relative_luminance_torch(target_b) - relative_luminance_torch(target_a)
     return (delta_pred - delta_target).abs().mean()
+
+
+def warp_by_shift(
+    frames: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Translate `frames` by a per-item global shift, differentiably.
+
+    This is the torch counterpart of `detector.motion.compensate_shift`, and
+    it must stay one: the temporal loss compares two frames after cancelling
+    camera motion, and if it cancels a different motion than the Detector
+    did, it scores an alignment the pass/fail rule never saw.
+
+    `compensate_shift` fills the vacated edge with BORDER_REPLICATE, which
+    invents correspondences that do not exist. Here the edge is zero-filled
+    and reported through the returned validity mask instead, so a caller can
+    exclude it rather than average fabricated pixels into a score.
+
+    Args:
+        frames: (B, C, H, W).
+        dx, dy: (B,) shifts in pixels, same sign convention as
+            `compensate_shift` (positive dx moves content right).
+
+    Returns:
+        (warped, valid) where `valid` is (B, 1, H, W), 1 where the sample
+        came from inside the source and 0 where it did not.
+    """
+    batch, _channels, height, width = frames.shape
+    device, dtype = frames.device, frames.dtype
+
+    # affine_grid works in normalised [-1, 1] coordinates, and its theta maps
+    # OUTPUT coordinates to INPUT ones -- so a shift of +dx pixels of content
+    # to the right means sampling dx pixels to the LEFT, hence the negation.
+    theta = torch.zeros(batch, 2, 3, device=device, dtype=dtype)
+    theta[:, 0, 0] = 1.0
+    theta[:, 1, 1] = 1.0
+    theta[:, 0, 2] = -2.0 * dx.to(device=device, dtype=dtype) / max(width - 1, 1)
+    theta[:, 1, 2] = -2.0 * dy.to(device=device, dtype=dtype) / max(height - 1, 1)
+
+    grid = F.affine_grid(theta, (batch, 1, height, width), align_corners=True)
+    warped = F.grid_sample(frames, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+
+    ones = torch.ones(batch, 1, height, width, device=device, dtype=dtype)
+    valid = F.grid_sample(ones, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    return warped, valid
+
+
+def self_supervised_loss(
+    out_a: torch.Tensor,
+    out_b: torch.Tensor,
+    in_a: torch.Tensor,
+    in_b: torch.Tensor,
+    dx: torch.Tensor,
+    dy: torch.Tensor,
+    profile: ThresholdProfile,
+    lambda_temporal: float = 1.0,
+    lambda_risk: float = 1.0,
+    tau: float = 0.02,
+    tau_area: float = 0.05,
+) -> dict[str, torch.Tensor]:
+    """Loss for two consecutive frames, with no clean reference.
+
+    Three terms pull against each other, but not as evenly as that suggests.
+    A 400-step Adam optimisation run directly against this loss (see
+    `docs/superpowers/specs/2026-08-07-soft-risk-agreement.md`'s companion
+    measurement) found:
+
+    - temporal is what actually *moves* the output -- at settling it holds
+      35-43% of the gradient magnitude on `out_a`, against 54-63% for
+      fidelity and only 1.7-2.3% for risk;
+    - risk is a near-threshold finisher, not a driver. At `tau = 0.02`,
+      pixels already flagged sit deep in the relaxing sigmoid's saturated
+      region, where its gradient is ~0; isolating risk (`lambda_temporal=0,
+      lambda_risk=100`) moved a fully-flagged case's flagged area by
+      0.0000. `max_area_ratio` is not an attractor the output settles at --
+      a global-flash case measured settling at soft area 0.107 (hard 0.000)
+      against a limit of 0.25, well clear of it, and an already-compliant
+      input (hard 0.0938) still got pushed further, to 0.0811. The
+      equilibrium is set by fidelity vs. temporal, not by the limit;
+    - risk is nonetheless load-bearing: with `lambda_risk=0`, both
+      flickering test cases stayed at their input's flagged area (amplitude
+      reduced, but still flagged) -- exactly the "corrects every frame by
+      the same proportion, flicker intact" failure this design exists to
+      remove. Without risk, nothing in the loss favours crossing the
+      threshold over merely approaching it.
+
+    Practically: **`lambda_temporal`, not `lambda_risk`, is the
+    over-correction knob.** Turning `lambda_risk` up sharpens the finish
+    near the limit; turning `lambda_temporal` up is what flattens more of
+    the frame.
+
+    The risk term is why this exists. Grading a frame against a clean
+    reference, as the previous objective did, cannot see flicker at all --
+    it is satisfied by correcting every frame in the same proportion, which
+    is measurably what the trained model learned to do.
+
+    `dx`/`dy` come from `detector.motion.estimate_global_shift` on the INPUT
+    pair, not the outputs: the motion is a property of the footage, and
+    using the Detector's own estimate keeps the loss scoring the alignment
+    the pass/fail rule was computed on.
+    """
+    # Imported locally: training.soft_risk imports relative_luminance_torch
+    # from this module at module level, so a top-level import here would be
+    # circular.
+    from training.soft_risk import risk_penalty, soft_flagged_area
+
+    # All four terms use the SAME reduction convention: average per batch
+    # item first, then average across items. That matters once items in a
+    # batch have unequal valid-pixel counts (e.g. one item's warp clips more
+    # border than another's) -- pooling raw elements across the batch before
+    # averaging would silently down-weight the item with fewer valid pixels
+    # instead of counting every item equally.
+    fidelity = (
+        F.l1_loss(out_a, in_a, reduction="none").mean(dim=(1, 2, 3))
+        + F.l1_loss(out_b, in_b, reduction="none").mean(dim=(1, 2, 3))
+    ).mean()
+
+    warped_out_a, valid = warp_by_shift(out_a, dx, dy)
+    luminance_delta = (
+        relative_luminance_torch(warped_out_a) - relative_luminance_torch(out_b)
+    ).abs()
+    per_item_denominator = valid.sum(dim=(1, 2, 3)).clamp(min=1e-6)
+    temporal = ((luminance_delta * valid).sum(dim=(1, 2, 3)) / per_item_denominator).mean()
+
+    area = soft_flagged_area(warped_out_a, out_b, profile, tau=tau, valid_mask=valid)
+    risk = risk_penalty(area, profile.max_area_ratio, tau_area=tau_area).mean()
+
+    return {
+        "loss": fidelity + lambda_temporal * temporal + lambda_risk * risk,
+        "fidelity": fidelity,
+        "temporal": temporal,
+        "risk": risk,
+        "soft_area": area.mean(),
+    }
