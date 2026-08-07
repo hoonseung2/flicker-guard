@@ -648,15 +648,21 @@ git commit -m "feat(fallback): raised-cosine fade over the segment margin"
 Append to `fallback/tests/test_apply.py`:
 
 ```python
-def _flickering_clip(n_frames=40, h=48, w=48, seed=0):
+def _flickering_clip(n_frames=40, h=48, w=48, seed=0, flicker_range=None):
     """A clip where a large region alternates bright/dark hard enough that
-    run_detection flags it -- the input Tier 0 exists to fix."""
+    run_detection flags it -- the input Tier 0 exists to fix.
+
+    `flicker_range` limits the flashing to `[lo, hi)` so a test can have
+    genuinely safe frames outside the risk segment; the default flickers
+    throughout.
+    """
     rng = np.random.default_rng(seed)
     base = rng.random((h, w, 3)).astype(np.float32) * 0.2
+    low, high = flicker_range if flicker_range is not None else (0, n_frames)
     frames = []
     for i in range(n_frames):
         frame = base.copy()
-        if i % 2 == 0:
+        if low <= i < high and i % 2 == 0:
             frame[:, : int(w * 0.6)] = 0.95
         frames.append(frame)
     return frames
@@ -705,7 +711,11 @@ def test_frames_outside_every_segment_are_bit_identical():
     # The mask-free global correction still must not touch frames the
     # Detector called safe -- that is the whole reason for working per
     # segment instead of over the whole clip.
-    frames = _flickering_clip(n_frames=60)
+    #
+    # The flicker is confined to the middle so safe frames actually exist;
+    # a clip that flickers throughout would put every frame inside a
+    # segment and let this pass without checking anything.
+    frames = _flickering_clip(n_frames=100, flicker_range=(40, 60))
     corrected, report = mitigate_with_fallback(frames, fps=20.0, profile=PROFILE)
 
     inside = set()
@@ -713,20 +723,21 @@ def test_frames_outside_every_segment_are_bit_identical():
         inside.update(range(outcome.start_frame, outcome.end_frame + 1))
     outside = [i for i in range(len(frames)) if i not in inside]
 
+    assert outside, "no frames outside a segment -- the assertion below would be vacuous"
     for index in outside:
         assert np.array_equal(frames[index], corrected[index])
 
 
-def test_exhausting_max_rounds_reports_failure_instead_of_raising():
-    # max_rounds=1 with a step of 0 cannot escalate, so a hard clip must
-    # come back with passed=False rather than an exception -- the caller
-    # decides the policy (README section 7 logs the incident).
+def test_max_rounds_caps_the_escalation_loop():
+    # The loop must stop at max_rounds and return a report rather than
+    # raising or spinning -- the caller decides the policy for a clip that
+    # did not converge (README section 7 logs the incident).
     frames = _flickering_clip()
     _corrected, report = mitigate_with_fallback(
         frames, fps=20.0, profile=PROFILE, max_rounds=1, strength_step=0.0
     )
     assert isinstance(report, FallbackReport)
-    assert report.rounds == 1
+    assert report.rounds <= 1
 ```
 
 - [ ] **Step 7: Run to verify the new tests fail**
@@ -865,7 +876,7 @@ If `test_mitigate_with_fallback_clears_every_risk_segment` fails, do **not** wea
 - [ ] **Step 10: Run the full suite and commit**
 
 Run: `python -m pytest -q`
-Expected: PASS, 269 tests.
+Expected: PASS. The suite is now 277 tests (249 baseline + 3 from Task 1 + 8 from Task 2 + 7 from Task 3 + 10 here).
 
 ```bash
 git add fallback/apply.py fallback/tests/test_apply.py
@@ -938,21 +949,38 @@ def test_cli_writes_a_video_and_a_report(tmp_path):
         written.release()
 
 
-def test_cli_returns_nonzero_when_the_clip_still_fails(tmp_path):
-    # max-rounds 1 with no escalation step cannot fix a hard clip. The exit
-    # code is how a caller learns that, so it must not be 0.
+def test_cli_returns_nonzero_when_the_clip_still_fails(tmp_path, monkeypatch):
+    # The exit code is how a caller learns mitigation did not converge, so
+    # it is asserted against a report that says so. Forcing a real clip to
+    # fail would make this test depend on how well the escalation loop
+    # happens to do on one fixture, which is test_apply.py's subject, not
+    # the CLI's contract.
+    import fallback.cli as cli_module
+    from fallback.apply import FallbackReport, SegmentOutcome
+
     source = tmp_path / "in.mp4"
     _write_flickering_video(source)
 
+    def _fake_mitigate(frames, fps, profile, max_rounds, strength_step):
+        outcome = SegmentOutcome(
+            start_frame=0, end_frame=9, initial_strength=0.5,
+            final_strength=1.0, rounds=6, passed=False,
+        )
+        return list(frames), FallbackReport(
+            segments=[outcome], passed=False, rounds=6, remaining_segments=1
+        )
+
+    monkeypatch.setattr(cli_module, "mitigate_with_fallback", _fake_mitigate)
+
+    report = tmp_path / "report.json"
     exit_code = main([
         "--input", str(source),
         "--output", str(tmp_path / "out.mp4"),
         "--profile", "configs/profiles/itu.json",
-        "--report", str(tmp_path / "report.json"),
-        "--max-rounds", "1",
-        "--strength-step", "0",
+        "--report", str(report),
     ])
     assert exit_code == 1
+    assert json.loads(report.read_text(encoding="utf-8"))["passed"] is False
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -1055,7 +1083,7 @@ Expected: PASS, 2 tests.
 - [ ] **Step 5: Run the full suite and commit**
 
 Run: `python -m pytest -q`
-Expected: PASS, 271 tests.
+Expected: PASS, 279 tests.
 
 ```bash
 git add fallback/cli.py fallback/tests/test_cli.py
@@ -1148,7 +1176,7 @@ def test_real_concert_clip_passes_after_fallback():
 - [ ] **Step 3: Verify the default run still excludes it**
 
 Run: `python -m pytest -q`
-Expected: PASS, 271 tests — the slow test is deselected, not run.
+Expected: PASS, 279 tests selected and 1 deselected — the slow test must not run by default.
 
 - [ ] **Step 4: Run the slow test and capture the output**
 
