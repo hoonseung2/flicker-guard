@@ -104,3 +104,58 @@ def test_temporal_loss_gradients_flow_and_stay_finite_out_of_range():
     loss.backward()
     assert torch.isfinite(loss).all()
     assert torch.isfinite(pred_b.grad).all()
+
+
+def test_warp_by_shift_matches_compensate_shift_for_integer_shifts():
+    # The loss must move pixels the same way the Detector does, or it scores
+    # a different alignment than the one the pass/fail rule was computed on.
+    from detector.motion import compensate_shift
+    from training.mitigator_losses import warp_by_shift
+
+    frame = np.random.default_rng(0).random((32, 32)).astype(np.float32)
+    expected = compensate_shift(frame, 3.0, -2.0)
+
+    warped, _valid = warp_by_shift(
+        torch.from_numpy(frame)[None, None], torch.tensor([3.0]), torch.tensor([-2.0])
+    )
+    # Compare the interior only; the two disagree at the border by
+    # construction (cv2 replicates, grid_sample zero-fills and the validity
+    # mask marks it), and that difference is what `valid` exists to express.
+    assert np.allclose(warped[0, 0, 4:-4, 4:-4].numpy(), expected[4:-4, 4:-4], atol=1e-4)
+
+
+def test_warp_by_shift_zero_is_the_identity():
+    from training.mitigator_losses import warp_by_shift
+
+    frame = torch.rand(2, 3, 16, 16)
+    warped, valid = warp_by_shift(frame, torch.zeros(2), torch.zeros(2))
+    assert torch.allclose(warped, frame, atol=1e-5)
+    assert valid.min() > 0.99
+
+
+def test_warp_by_shift_marks_the_invented_border_invalid():
+    from training.mitigator_losses import warp_by_shift
+
+    frame = torch.rand(1, 1, 32, 32)
+    _warped, valid = warp_by_shift(frame, torch.tensor([6.0]), torch.tensor([0.0]))
+    assert valid[0, 0, :, 0].max() < 0.5     # left column came from outside
+    assert valid[0, 0, :, -1].min() > 0.5    # right column is real
+
+
+def test_warp_by_shift_is_differentiable():
+    from training.mitigator_losses import warp_by_shift
+
+    frame = torch.rand(1, 3, 16, 16, requires_grad=True)
+    warped, _valid = warp_by_shift(frame, torch.tensor([2.5]), torch.tensor([-1.5]))
+    warped.sum().backward()
+    assert torch.isfinite(frame.grad).all()
+    assert frame.grad.abs().sum() > 0
+
+
+def test_warp_by_shift_handles_per_item_shifts_in_a_batch():
+    from training.mitigator_losses import warp_by_shift
+
+    frame = torch.rand(1, 1, 16, 16).repeat(2, 1, 1, 1)
+    warped, _valid = warp_by_shift(frame, torch.tensor([0.0, 4.0]), torch.zeros(2))
+    assert torch.allclose(warped[0], frame[0], atol=1e-5)
+    assert not torch.allclose(warped[1], frame[1], atol=1e-2)

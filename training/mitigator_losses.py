@@ -107,3 +107,47 @@ def temporal_consistency_loss(
     delta_pred = relative_luminance_torch(pred_b) - relative_luminance_torch(pred_a)
     delta_target = relative_luminance_torch(target_b) - relative_luminance_torch(target_a)
     return (delta_pred - delta_target).abs().mean()
+
+
+def warp_by_shift(
+    frames: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Translate `frames` by a per-item global shift, differentiably.
+
+    This is the torch counterpart of `detector.motion.compensate_shift`, and
+    it must stay one: the temporal loss compares two frames after cancelling
+    camera motion, and if it cancels a different motion than the Detector
+    did, it scores an alignment the pass/fail rule never saw.
+
+    `compensate_shift` fills the vacated edge with BORDER_REPLICATE, which
+    invents correspondences that do not exist. Here the edge is zero-filled
+    and reported through the returned validity mask instead, so a caller can
+    exclude it rather than average fabricated pixels into a score.
+
+    Args:
+        frames: (B, C, H, W).
+        dx, dy: (B,) shifts in pixels, same sign convention as
+            `compensate_shift` (positive dx moves content right).
+
+    Returns:
+        (warped, valid) where `valid` is (B, 1, H, W), 1 where the sample
+        came from inside the source and 0 where it did not.
+    """
+    batch, _channels, height, width = frames.shape
+    device, dtype = frames.device, frames.dtype
+
+    # affine_grid works in normalised [-1, 1] coordinates, and its theta maps
+    # OUTPUT coordinates to INPUT ones -- so a shift of +dx pixels of content
+    # to the right means sampling dx pixels to the LEFT, hence the negation.
+    theta = torch.zeros(batch, 2, 3, device=device, dtype=dtype)
+    theta[:, 0, 0] = 1.0
+    theta[:, 1, 1] = 1.0
+    theta[:, 0, 2] = -2.0 * dx.to(device=device, dtype=dtype) / max(width - 1, 1)
+    theta[:, 1, 2] = -2.0 * dy.to(device=device, dtype=dtype) / max(height - 1, 1)
+
+    grid = F.affine_grid(theta, (batch, 1, height, width), align_corners=True)
+    warped = F.grid_sample(frames, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+
+    ones = torch.ones(batch, 1, height, width, device=device, dtype=dtype)
+    valid = F.grid_sample(ones, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    return warped, valid
