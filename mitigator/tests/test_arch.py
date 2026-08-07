@@ -96,3 +96,28 @@ def test_mitigate_frame_takes_strength():
     # mask is all zeros, so the hard blend must return the centre frame
     # untouched regardless of what the network produced.
     assert torch.allclose(result, window[:, 3:6], atol=1e-6)
+
+
+def test_strength_is_isolated_per_batch_item():
+    # Each item's strength is broadcast spatially before concatenation, and
+    # the network has no batch-mixing layer (GroupNorm(1, ...) normalises
+    # per-sample, MultiheadAttention attends only within each sample's own
+    # H*W tokens) -- so item 0's output must be identical whether it's run
+    # alone or alongside item 1 conditioned on a different strength. This
+    # pins that down explicitly rather than leaving it to be checked by hand.
+    from mitigator.arch import MitigatorNet
+
+    torch.manual_seed(0)
+    model = MitigatorNet()
+    model.eval()
+    window = torch.rand(2, 9, 32, 32)
+    mask = torch.ones(2, 1, 32, 32)
+    strength = torch.tensor([[0.2], [0.8]])
+
+    with torch.no_grad():
+        batched = model(window, mask, strength)
+        solo_0 = model(window[:1], mask[:1], strength[:1])
+        solo_1 = model(window[1:], mask[1:], strength[1:])
+
+    assert torch.allclose(batched[:1], solo_0, atol=1e-5)
+    assert torch.allclose(batched[1:], solo_1, atol=1e-5)

@@ -26,10 +26,12 @@ def test_mitigate_segment_returns_same_length_and_shape():
         assert out_frame.shape == in_frame.shape
 
 
-def test_mitigate_segment_passes_through_frames_with_no_target_histogram():
-    # fps=10 means the first ~10 frames of any clip have target_histogram
-    # None (Detector's trailing window hasn't filled yet) -- those frames
-    # must come back byte-identical to the input, untouched by the network.
+def test_mitigate_segment_passes_through_frames_outside_any_risk_segment():
+    # A flat, never-flickering clip never trips a RiskSegment, so
+    # required_strength stays 0.0 for every frame regardless of Detector's
+    # uncertain warm-up window (which conservatively masks whole frames
+    # without implying anything risky was found) -- none of it should reach
+    # the network, and frame 0 must come back byte-identical to the input.
     torch.manual_seed(0)
     model = MitigatorNet()
     frames = _flat_frames(20, 16, 16)
@@ -59,7 +61,10 @@ def test_mitigate_segment_downscales_large_frames_for_bottleneck_attention(monke
     no_mask = np.zeros((h, w), dtype=bool)
     fake_priors = [
         FramePrior(frame_index=0, target_histogram=None, mask=no_mask),
-        FramePrior(frame_index=1, target_histogram=np.full(64, 1.0 / 64, dtype=np.float32), mask=mask),
+        FramePrior(
+            frame_index=1, target_histogram=np.full(64, 1.0 / 64, dtype=np.float32),
+            mask=mask, required_strength=0.5,
+        ),
         FramePrior(frame_index=2, target_histogram=None, mask=no_mask),
     ]
     monkeypatch.setattr(infer_module, "compute_prior", lambda frames, fps, profile: fake_priors)
@@ -76,6 +81,23 @@ def test_mitigate_segment_passes_through_frame_on_nan_output(monkeypatch):
     # must never let that reach the returned frames -- fall back to the
     # original input for that frame instead.
     import mitigator.infer as infer_module
+    from prior.compute import FramePrior
+
+    h, w = 16, 16
+    mask = np.zeros((h, w), dtype=bool)
+    mask[4:8, 4:8] = True
+    no_mask = np.zeros((h, w), dtype=bool)
+    # A frame in an actual risk segment (mask set, required_strength > 0)
+    # is required to reach the gate at all -- flat, never-risky frames (as
+    # in the other tests in this file) never trip the mitigate_frame call
+    # this test exists to exercise, since required_strength stays 0.0 for
+    # them and mitigate_segment now skips them before ever calling the
+    # (patched) model.
+    fake_priors = [
+        FramePrior(frame_index=0, target_histogram=None, mask=mask, required_strength=0.5),
+        *[FramePrior(frame_index=i, target_histogram=None, mask=no_mask) for i in range(1, 20)],
+    ]
+    monkeypatch.setattr(infer_module, "compute_prior", lambda frames, fps, profile: fake_priors)
 
     def _nan_mitigate_frame(window, mask, strength, model):
         return torch.full((1, 3, window.shape[-2], window.shape[-1]), float("nan"))

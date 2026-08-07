@@ -38,7 +38,20 @@ def mitigate_segment(
     # completion, which read as a stuck process rather than a slow one).
     print(f"mitigate_segment: computing detection priors for {len(frames)} frames...", flush=True)
     priors = compute_prior(frames, fps=fps, profile=profile)
-    to_correct = sum(1 for prior in priors if prior.target_histogram is not None)
+    # Strength conditioning is always available (required_strength defaults
+    # to 0.0), unlike the old histogram, which was None until enough
+    # non-masked reference pixels had accumulated -- so "is there
+    # conditioning" is no longer the right question. A frame needs
+    # correction when it sits inside an actual risk segment: required_strength
+    # is only ever set above 0.0 by _assign_segment_strengths for frames of a
+    # detected RiskSegment, so it (together with a non-empty mask) is exactly
+    # that signal. mask alone is not enough -- Detector conservatively masks
+    # the whole frame during its uncertain warm-up window even when nothing
+    # risky has actually been found, and required_strength stays 0.0 for
+    # those frames. mitigate_frame's hard blend would return the input
+    # byte-for-byte wherever mask == 0 regardless of strength, so this gate
+    # is purely about skipping wasted forward passes, not pixel correctness.
+    to_correct = sum(1 for prior in priors if prior.required_strength > 0.0 and prior.mask.any())
     print(f"mitigate_segment: priors ready, {to_correct} of {len(frames)} frames need correction...", flush=True)
     was_training = model.training
     model.eval()
@@ -61,8 +74,8 @@ def mitigate_segment(
     try:
         with torch.no_grad():
             for prior in priors:
-                if prior.target_histogram is None:
-                    continue  # no conditioning available -- pass through unchanged
+                if not (prior.required_strength > 0.0 and prior.mask.any()):
+                    continue  # not in a risk segment -- nothing to correct, would be a wasted forward pass
 
                 i = prior.frame_index
                 prev_idx = max(0, i - 1)
