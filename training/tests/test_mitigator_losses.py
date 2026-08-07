@@ -159,3 +159,109 @@ def test_warp_by_shift_handles_per_item_shifts_in_a_batch():
     warped, _valid = warp_by_shift(frame, torch.tensor([0.0, 4.0]), torch.zeros(2))
     assert torch.allclose(warped[0], frame[0], atol=1e-5)
     assert not torch.allclose(warped[1], frame[1], atol=1e-2)
+
+
+def _profile():
+    from detector.profiles import ThresholdProfile
+    return ThresholdProfile(
+        name="test", max_flashes_per_second=3, max_area_ratio=0.25,
+        general_flash_dark_threshold=0.80, general_flash_delta_threshold=0.10,
+        red_saturation_ratio_threshold=0.80,
+    )
+
+
+def _flickering_pair(seed=0):
+    """Input frames: a dark frame and a much brighter one. Pure flicker."""
+    g = torch.Generator().manual_seed(seed)
+    dark = torch.rand(1, 3, 32, 32, generator=g) * 0.2
+    bright = (dark + 0.7).clamp(0, 1)
+    return dark, bright
+
+
+def test_passing_the_input_through_unchanged_costs_zero_fidelity():
+    from training.mitigator_losses import self_supervised_loss
+
+    in_a, in_b = _flickering_pair()
+    terms = self_supervised_loss(in_a, in_b, in_a, in_b, torch.zeros(1), torch.zeros(1), _profile())
+    assert terms["fidelity"].item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_do_nothing_output_is_still_charged_for_risk():
+    # This is the whole design: passing the input straight through is free
+    # on fidelity and free on nothing else. If the risk term did not fire
+    # here, the model's optimum would be to do nothing.
+    from training.mitigator_losses import self_supervised_loss
+
+    in_a, in_b = _flickering_pair()
+    terms = self_supervised_loss(in_a, in_b, in_a, in_b, torch.zeros(1), torch.zeros(1), _profile())
+    assert terms["risk"].item() > 0.05
+    assert terms["temporal"].item() > 0.05
+    assert terms["loss"].item() > terms["fidelity"].item()
+
+
+def test_flattening_the_pair_clears_the_risk_term_but_costs_fidelity():
+    from training.mitigator_losses import self_supervised_loss
+
+    in_a, in_b = _flickering_pair()
+    flat = (in_a + in_b) / 2
+    terms = self_supervised_loss(flat, flat, in_a, in_b, torch.zeros(1), torch.zeros(1), _profile())
+
+    assert terms["risk"].item() < 0.01
+    assert terms["temporal"].item() < 0.01
+    assert terms["fidelity"].item() > 0.05
+
+
+def test_lambda_risk_zero_removes_the_risk_term_entirely():
+    # The pre-design objective, for regression comparison.
+    from training.mitigator_losses import self_supervised_loss
+
+    in_a, in_b = _flickering_pair()
+    terms = self_supervised_loss(in_a, in_b, in_a, in_b, torch.zeros(1), torch.zeros(1),
+                                 _profile(), lambda_risk=0.0)
+    assert terms["loss"].item() == pytest.approx(
+        (terms["fidelity"] + terms["temporal"]).item(), abs=1e-6
+    )
+
+
+def test_the_shift_is_applied_before_the_temporal_comparison():
+    # A pure pan is not flicker. With the correct shift the two frames align
+    # and the temporal term collapses; without it the same pair looks like a
+    # large change. If this fails, the loss will fight camera movement.
+    from training.mitigator_losses import self_supervised_loss
+
+    g = torch.Generator().manual_seed(7)
+    a = torch.rand(1, 3, 48, 48, generator=g) * 0.5 + 0.2
+    b = torch.roll(a, shifts=4, dims=3)
+
+    compensated = self_supervised_loss(a, b, a, b, torch.tensor([4.0]), torch.zeros(1), _profile())
+    ignored = self_supervised_loss(a, b, a, b, torch.zeros(1), torch.zeros(1), _profile())
+    assert compensated["temporal"].item() < ignored["temporal"].item() * 0.5
+
+
+def test_all_terms_produce_finite_gradients():
+    from training.mitigator_losses import self_supervised_loss
+
+    in_a, in_b = _flickering_pair(seed=3)
+    out_a = (in_a * 0.8).clone().requires_grad_(True)
+    out_b = (in_b * 0.8).clone().requires_grad_(True)
+
+    self_supervised_loss(out_a, out_b, in_a, in_b, torch.zeros(1), torch.zeros(1),
+                         _profile())["loss"].backward()
+    for grad in (out_a.grad, out_b.grad):
+        assert torch.isfinite(grad).all()
+        assert grad.abs().sum() > 0
+
+
+def test_reported_terms_sum_to_the_reported_loss():
+    # The training loop logs these separately to watch the fidelity/risk
+    # trade-off; a reported breakdown that does not reconstruct the total
+    # would make that log misleading.
+    from training.mitigator_losses import self_supervised_loss
+
+    in_a, in_b = _flickering_pair(seed=5)
+    lt, lr = 0.7, 1.3
+    terms = self_supervised_loss(in_a * 0.9, in_b * 0.9, in_a, in_b,
+                                 torch.zeros(1), torch.zeros(1), _profile(),
+                                 lambda_temporal=lt, lambda_risk=lr)
+    expected = terms["fidelity"] + lt * terms["temporal"] + lr * terms["risk"]
+    assert terms["loss"].item() == pytest.approx(expected.item(), abs=1e-6)

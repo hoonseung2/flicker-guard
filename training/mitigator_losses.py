@@ -7,6 +7,8 @@ that adding a new dependency isn't worth it.
 import torch
 import torch.nn.functional as F
 
+from detector.profiles import ThresholdProfile
+
 _C1 = 0.01 ** 2
 _C2 = 0.03 ** 2
 
@@ -151,3 +153,64 @@ def warp_by_shift(
     ones = torch.ones(batch, 1, height, width, device=device, dtype=dtype)
     valid = F.grid_sample(ones, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
     return warped, valid
+
+
+def self_supervised_loss(
+    out_a: torch.Tensor,
+    out_b: torch.Tensor,
+    in_a: torch.Tensor,
+    in_b: torch.Tensor,
+    dx: torch.Tensor,
+    dy: torch.Tensor,
+    profile: ThresholdProfile,
+    lambda_temporal: float = 1.0,
+    lambda_risk: float = 1.0,
+    tau: float = 0.02,
+    tau_area: float = 0.05,
+) -> dict[str, torch.Tensor]:
+    """Loss for two consecutive frames, with no clean reference.
+
+    Three terms pull against each other:
+
+    - fidelity keeps the output on its input, so doing nothing is the
+      default and every change has to be paid for;
+    - temporal drives consecutive outputs together after cancelling camera
+      motion, which is what actually removes flicker;
+    - risk charges only for exceeding the Detector's own area limit, so the
+      correction stops as soon as the clip is compliant instead of
+      flattening everything a global weight happens to reach.
+
+    The risk term is why this exists. Grading a frame against a clean
+    reference, as the previous objective did, cannot see flicker at all --
+    it is satisfied by correcting every frame in the same proportion, which
+    is measurably what the trained model learned to do.
+
+    `dx`/`dy` come from `detector.motion.estimate_global_shift` on the INPUT
+    pair, not the outputs: the motion is a property of the footage, and
+    using the Detector's own estimate keeps the loss scoring the alignment
+    the pass/fail rule was computed on.
+    """
+    # Imported locally: training.soft_risk imports relative_luminance_torch
+    # from this module at module level, so a top-level import here would be
+    # circular.
+    from training.soft_risk import risk_penalty, soft_flagged_area
+
+    fidelity = F.l1_loss(out_a, in_a) + F.l1_loss(out_b, in_b)
+
+    warped_out_a, valid = warp_by_shift(out_a, dx, dy)
+    luminance_delta = (
+        relative_luminance_torch(warped_out_a) - relative_luminance_torch(out_b)
+    ).abs()
+    denominator = valid.sum().clamp(min=1e-6)
+    temporal = (luminance_delta * valid).sum() / denominator
+
+    area = soft_flagged_area(warped_out_a, out_b, profile, tau=tau, valid_mask=valid)
+    risk = risk_penalty(area, profile.max_area_ratio, tau_area=tau_area).mean()
+
+    return {
+        "loss": fidelity + lambda_temporal * temporal + lambda_risk * risk,
+        "fidelity": fidelity,
+        "temporal": temporal,
+        "risk": risk,
+        "soft_area": area.mean(),
+    }
