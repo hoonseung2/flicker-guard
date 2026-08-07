@@ -1,10 +1,8 @@
 import numpy as np
 
-from detector.luminance import relative_luminance
 from detector.pipeline import run_detection_with_masks
 from detector.profiles import ThresholdProfile
 from prior.compute import compute_prior
-from prior.histogram import compute_illumination_histogram
 from training.injection import inject_general_flash
 from training.params import InjectionWindow
 
@@ -33,70 +31,10 @@ def test_compute_prior_marks_injected_window_pixels_in_mask():
     assert results[6].mask.all()
 
 
-def test_compute_prior_target_histogram_returns_to_baseline_well_after_injection():
-    clean = _clean_clip(n=80, value=0.5)
-    window = InjectionWindow(
-        start_frame=10, end_frame=20, mask_top=0, mask_left=0,
-        mask_height=20, mask_width=20, period_frames=1, ramp_frames=10,
-    )
-    degraded = inject_general_flash(clean, window, dark_target=0.2, bright_target=0.8)
-
-    results = compute_prior(degraded, fps=10.0, profile=PROFILE)
-
-    baseline_histogram = compute_illumination_histogram(relative_luminance(clean[0]), n_bins=64)
-    late_target = results[75].target_histogram
-    assert late_target is not None
-    assert np.allclose(late_target, baseline_histogram, atol=1e-6)
-
-
-def test_compute_prior_target_never_picks_up_the_bright_pulse_during_injected_flicker():
-    clean = _clean_clip(n=80, value=0.5)
-    window = InjectionWindow(
-        start_frame=40, end_frame=50, mask_top=0, mask_left=0,
-        mask_height=20, mask_width=20, period_frames=1, ramp_frames=5,
-    )
-    degraded = inject_general_flash(clean, window, dark_target=0.2, bright_target=0.8)
-    results = compute_prior(degraded, fps=10.0, profile=PROFILE)
-
-    bright_pulse_histogram = compute_illumination_histogram(relative_luminance(degraded[41]), n_bins=64)
-    # Frame 40 (the pattern's first, dark frame) transitions dark-baseline ->
-    # slightly-darker, which the detector's transition_mask correctly does
-    # not flag as a flash -- so its own near-baseline content legitimately
-    # becomes the held reference for the rest of the fully-masked
-    # dark/bright alternation that follows. Frame 45 sits deep in that
-    # stretch; the one thing that must never happen is the DANGEROUS bright
-    # pulse leaking into the target the network is asked to correct toward.
-    assert not np.allclose(results[45].target_histogram, bright_pulse_histogram, atol=1e-6)
-
-
 def test_compute_prior_returns_frame_prior_per_frame_with_matching_indices():
     clean = _clean_clip(n=10)
     results = compute_prior(clean, fps=10.0, profile=PROFILE)
     assert [r.frame_index for r in results] == list(range(10))
-    assert results[0].target_histogram is None  # frame 0 always uncertain, no clean frame seen yet
-
-
-def test_compute_prior_target_is_a_trailing_average_not_the_latest_frame_alone():
-    # Regression test for the hybrid design: target histograms are derived
-    # from each frame's own non-masked pixels (so a continuously-risky clip
-    # never starves), but smoothed over a trailing window (like the old
-    # temporal approach) so the target doesn't jitter frame-to-frame with
-    # whatever the current frame happens to look like.
-    frames = []
-    for i in range(12):
-        value = 0.5 if i % 2 == 0 else 0.55
-        frames.append(np.full((20, 20, 3), value, dtype=np.float32))
-
-    results = compute_prior(frames, fps=4.0, profile=PROFILE)  # window_frames = round(4.0) = 4
-
-    hist_a = compute_illumination_histogram(relative_luminance(frames[10]), n_bins=64)  # value=0.5
-    hist_b = compute_illumination_histogram(relative_luminance(frames[11]), n_bins=64)  # value=0.55
-    expected = np.mean([hist_a, hist_b, hist_a, hist_b], axis=0)  # last 4 contributing frames: 8,9,10,11
-
-    assert np.allclose(results[11].target_histogram, expected, atol=1e-6)
-    # Not just the latest frame's own histogram -- that would mean no
-    # smoothing is happening at all.
-    assert not np.allclose(results[11].target_histogram, hist_b, atol=1e-6)
 
 
 def test_compute_prior_accepts_a_one_shot_generator():
@@ -176,3 +114,63 @@ def test_compute_prior_persistence_window_scales_with_fps():
     # 0.5s is 5 frames at 10fps but 15 at 30fps -- the wider window can only
     # flag more, never less.
     assert sum(p.mask.sum() for p in fast) > sum(p.mask.sum() for p in slow)
+
+
+def test_frame_prior_carries_the_segments_required_strength():
+    # The model sees a three-frame window; how hard this segment needs to be
+    # pushed is global context it cannot derive locally. Measured: the
+    # previous model reached a median 14.6% of its own target, and a
+    # histogram describing "what normal looks like" never told it how far to
+    # move.
+    import numpy as np
+    from prior.compute import compute_prior
+
+    rng = np.random.default_rng(0)
+    base = rng.random((24, 24, 3)).astype(np.float32) * 0.2
+    frames = []
+    for i in range(40):
+        frame = base.copy()
+        if 15 <= i < 30 and i % 2 == 0:
+            frame[:, :16] = 0.95
+        frames.append(frame)
+
+    priors = compute_prior(frames, fps=20.0, profile=PROFILE)
+
+    flagged = [p for p in priors if p.required_strength > 0.0]
+    assert flagged, "the flickering stretch should carry a nonzero strength"
+    assert all(0.0 <= p.required_strength <= 1.0 for p in priors)
+
+
+def test_frames_outside_a_risk_segment_have_zero_strength():
+    # A frame the Detector did not flag needs no correction, and a nonzero
+    # strength there would tell the model to move a frame that is already
+    # compliant.
+    import numpy as np
+    from prior.compute import compute_prior
+
+    rng = np.random.default_rng(1)
+    frames = [rng.random((24, 24, 3)).astype(np.float32) * 0.1 for _ in range(30)]
+
+    priors = compute_prior(frames, fps=20.0, profile=PROFILE)
+    assert all(p.required_strength == 0.0 for p in priors)
+
+
+def test_every_frame_in_one_segment_shares_that_segments_strength():
+    # required_strength is a per-segment quantity: it is the max over the
+    # segment's frame pairs, so handing different frames of one segment
+    # different values would be incoherent.
+    import numpy as np
+    from prior.compute import compute_prior
+
+    rng = np.random.default_rng(2)
+    base = rng.random((24, 24, 3)).astype(np.float32) * 0.2
+    frames = []
+    for i in range(40):
+        frame = base.copy()
+        if 15 <= i < 30 and i % 2 == 0:
+            frame[:, :16] = 0.95
+        frames.append(frame)
+
+    priors = compute_prior(frames, fps=20.0, profile=PROFILE)
+    values = {round(p.required_strength, 6) for p in priors if p.required_strength > 0.0}
+    assert len(values) == 1, f"expected one strength across the segment, got {values}"

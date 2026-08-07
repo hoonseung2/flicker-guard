@@ -6,10 +6,13 @@ frame -- measures how close the output is to a ground truth we made up.
 This one measures the thing the project is actually for: does our own
 Detector still flag the output? Zero remaining risk segments is the bar.
 
-The frame-difference statistics are secondary but worth having, because a
-model can drive the segment count to zero by flattening the video into
-mush, and a collapsed global contrast shows up here as a suspiciously
-large drop in mean luminance delta.
+The frame-difference and contrast statistics are secondary but worth
+having, because a model can drive the segment count to zero by flattening
+the video into mush. Mean luminance barely moves when that happens -- a
+correction that compresses each frame toward its own mean is close to
+luminance-preserving by construction -- so within-frame contrast is
+reported directly (contrast_stats) instead of being inferred indirectly
+from luminance-delta drops.
 
 Run as a module from the repo root (scripts/ has no __init__.py):
 
@@ -74,7 +77,79 @@ def luminance_stats(frames: list[np.ndarray]) -> dict:
     }
 
 
-def _print_report(before: dict, after: dict, lum_before: dict, lum_after: dict, fps: float) -> None:
+def _frame_spreads(frames: list[np.ndarray]) -> np.ndarray:
+    """Per-frame within-frame (spatial) luminance spread: one `relative_luminance`
+    call and one `std` per frame.
+
+    Callers that need more than one aggregate over overlapping frame lists
+    (e.g. a whole-clip figure and an in-segment figure restricted to a
+    subset of the same frames) should call this once and slice/index the
+    result, then reduce each slice with `_aggregate_contrast`, rather than
+    calling `contrast_stats` once per frame list -- that would recompute
+    `relative_luminance` for any frame appearing in more than one list.
+    """
+    return np.array([float(relative_luminance(frame).std()) for frame in frames])
+
+
+def _aggregate_contrast(spreads: np.ndarray) -> dict:
+    """Reduce a per-frame spread array (from `_frame_spreads`) to the reported
+    mean/p95/nan-count triple.
+
+    NaN handling: a frame containing NaN pixels (the mitigator can pass
+    NaN through when its model output is degenerate) produces a NaN std
+    for that one frame. Aggregating with plain mean/percentile would let
+    a single bad frame poison the entire report into "nan", hiding every
+    other frame's real, informative contrast number. Instead this drops
+    only the contaminated frame(s) from the aggregate (nanmean/nanpercentile)
+    and, when any were dropped, that count is surfaced in the report rather
+    than silently discarded.
+    """
+    finite = spreads[np.isfinite(spreads)]
+    return {
+        "mean_contrast": float(np.nanmean(finite)) if finite.size else 0.0,
+        "p95_contrast": float(np.nanpercentile(finite, 95)) if finite.size else 0.0,
+        "nan_frames": int(spreads.size - finite.size),
+    }
+
+
+def contrast_stats(frames: list[np.ndarray]) -> dict:
+    """Within-frame luminance spread, averaged over the clip.
+
+    This is the damage figure to report, not mean luminance. The Tier 0
+    fallback compresses each frame toward its own trailing mean, so the
+    mean is near-invariant by construction -- on one real clip it rose
+    1.87% while contrast fell 52.8%. Reporting the mean as a cost makes a
+    heavy correction look gentle; contrast is what actually moves.
+
+    "Contrast" here is within-frame spatial spread (the std of a single
+    frame's relative luminance), not frame-to-frame temporal contrast --
+    that would just remeasure flicker under a different name. In particular
+    this makes contrast, unlike a temporal measure, invariant to the order
+    of the frames passed in: it is a per-frame quantity, reduced with an
+    order-agnostic mean/percentile.
+
+    This still computes its own `relative_luminance` per frame, independent
+    of `luminance_stats`/`detection_stats`, which do the same thing on the
+    same frames elsewhere in this module -- calling this function does not
+    avoid that cross-function duplication. What it does avoid, via
+    `_frame_spreads`/`_aggregate_contrast`, is recomputing luminance a
+    second time for a frame that appears in more than one call to this
+    function (e.g. a whole-clip call and an in-segment call over a subset
+    of the same frames) -- callers with that shape should use those two
+    helpers directly instead of calling this function more than once.
+
+    NaN handling: see `_aggregate_contrast`. This defends against NaN
+    pixels reaching this function from any source, not because a live
+    passthrough path was found -- none was; the mitigator itself falls
+    back to the original frame on non-finite model output before frames
+    ever get here.
+    """
+    return _aggregate_contrast(_frame_spreads(frames))
+
+
+def _print_report(before: dict, after: dict, lum_before: dict, lum_after: dict, fps: float,
+                   contrast_before: dict, contrast_after: dict,
+                   contrast_affected: tuple[dict, dict] | None) -> None:
     def change(a: float, b: float) -> str:
         if a == 0:
             return "  --  "
@@ -103,6 +178,55 @@ def _print_report(before: dict, after: dict, lum_before: dict, lum_after: dict, 
               f"{change(lum_before[key], lum_after[key]):>10}")
     print("  (mean luminance should stay roughly flat -- a large drop means the\n"
           "   flicker was removed by darkening the video, not by repairing it)")
+
+    print("\n=== Within-frame contrast (the honest damage figure) ===")
+    print(f"{'metric':<28}{'before':>10}{'after':>10}{'change':>10}")
+    for label, key in [("whole-clip mean contrast", "mean_contrast"), ("whole-clip p95 contrast", "p95_contrast")]:
+        print(f"{label:<28}{contrast_before[key]:>10.4f}{contrast_after[key]:>10.4f}"
+              f"{change(contrast_before[key], contrast_after[key]):>10}")
+    if contrast_before["nan_frames"] or contrast_after["nan_frames"]:
+        print(f"  WARNING: {contrast_before['nan_frames']} before / {contrast_after['nan_frames']} after "
+              f"frame(s) had NaN pixels and were dropped from the contrast average above (not from "
+              f"any other section of this report).")
+
+    # Whole-clip averaging silently dilutes the number that matters: a
+    # correction can (and, on real footage, does) hammer contrast only
+    # inside the frames it actually touches -- the segments flagged in the
+    # ORIGINAL video -- while leaving the other 90%+ of the clip untouched.
+    # Averaging over all frames then reports a small, easy-to-miss number
+    # even when the local damage is severe (measured on a real clip: -6%
+    # whole-clip vs -67% inside the flagged region). That is the same
+    # failure this task exists to fix, one level removed -- so report the
+    # in-segment number too, not just the diluted one, the same way the
+    # detector verdict block above separates padded segment frames from
+    # frames that actually tripped the rule.
+    if contrast_affected is not None:
+        contrast_before_affected, contrast_after_affected = contrast_affected
+        print(f"{'in-segment mean contrast':<28}{contrast_before_affected['mean_contrast']:>10.4f}"
+              f"{contrast_after_affected['mean_contrast']:>10.4f}"
+              f"{change(contrast_before_affected['mean_contrast'], contrast_after_affected['mean_contrast']):>10}")
+        print(f"{'in-segment p95 contrast':<28}{contrast_before_affected['p95_contrast']:>10.4f}"
+              f"{contrast_after_affected['p95_contrast']:>10.4f}"
+              f"{change(contrast_before_affected['p95_contrast'], contrast_after_affected['p95_contrast']):>10}")
+        print("  (in-segment = only frames the ORIGINAL video had flagged as risky -- the region")
+        print("   the correction actually touched. Whole-clip numbers dilute this if most of the")
+        print("   clip was never at risk and so was never corrected.)")
+        report_contrast_before = contrast_before_affected["mean_contrast"]
+        report_contrast_after = contrast_after_affected["mean_contrast"]
+    else:
+        print("  (no risk segments were flagged on the original -- no in-segment figure to report)")
+        report_contrast_before = contrast_before["mean_contrast"]
+        report_contrast_after = contrast_after["mean_contrast"]
+
+    contrast_change_pct = (
+        (report_contrast_after - report_contrast_before) / report_contrast_before * 100
+        if report_contrast_before else 0.0
+    )
+    print("  Tier 0 baseline on real clips: -52.8% (Anyma), -48.4% (Cera Khin), measured in-segment.")
+    print(f"  This run: {contrast_change_pct:+.1f}% mean contrast"
+          f"{' (in-segment)' if contrast_affected is not None else ' (whole-clip; no segment to isolate)'}.")
+    print("  A neural correction that passes but costs more contrast than this loses to a")
+    print("  classical method needing no GPU, no training data, and under 1 ms/frame.")
 
     print("\n=== Remaining risk segments ===")
     if not after["segments"]:
@@ -141,7 +265,37 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{len(original)} frames at {fps:.2f} fps ({len(original) / fps:.1f}s), profile {Path(args.profile).stem}")
     before = detection_stats(original, fps, profile)
     after = detection_stats(mitigated, fps, profile)
-    _print_report(before, after, luminance_stats(original), luminance_stats(mitigated), fps)
+
+    # Per-frame spatial spread, computed once per clip. Both the whole-clip
+    # and in-segment contrast figures below are reductions of these same
+    # arrays (see _frame_spreads/_aggregate_contrast) -- not two separate
+    # passes over relative_luminance for the frames that appear in both.
+    original_spreads = _frame_spreads(original)
+    mitigated_spreads = _frame_spreads(mitigated)
+
+    # Frames the ORIGINAL video had flagged -- the region a correction
+    # actually has reason to touch. Used to report contrast damage
+    # in-segment as well as whole-clip; see the comment in _print_report.
+    affected = sorted({
+        i for segment in before["segments"]
+        for i in range(segment.start_frame, segment.end_frame + 1)
+        if i < len(original)
+    })
+    if affected:
+        contrast_affected = (
+            _aggregate_contrast(original_spreads[affected]),
+            _aggregate_contrast(mitigated_spreads[affected]),
+        )
+    else:
+        contrast_affected = None
+
+    _print_report(
+        before, after,
+        luminance_stats(original), luminance_stats(mitigated),
+        fps,
+        _aggregate_contrast(original_spreads), _aggregate_contrast(mitigated_spreads),
+        contrast_affected,
+    )
     return 0
 
 

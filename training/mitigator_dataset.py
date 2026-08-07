@@ -1,7 +1,8 @@
 """Bridges DatasetSynth's data/synthetic/ output and PriorCalc's
-compute_prior into training examples for Mitigator: one example per risky,
-prior-conditioned frame, as a (3-frame degraded window, risk mask, target
-histogram) -> clean center-frame pair.
+compute_prior into training examples for Mitigator: one example per risky
+frame, as a (3-frame degraded window, risk mask, required strength) input,
+paired with a neighbour example so the self-supervised temporal term can
+compare two consecutive restored frames.
 
 Train/val split is a deterministic hash of clip_id, not a stored list --
 same philosophy as training.cli's per-sample rng derivation: the split is a
@@ -10,11 +11,11 @@ needs a separate file kept in sync. All samples for a given clip (both
 general and red pattern) land on the same side, so no clip's content leaks
 across the split.
 
-compute_prior's per-frame illumination histogram is expensive to reproduce
-every epoch (it re-runs Detector's full classical pipeline, including
-motion estimation, over the whole clip) -- it is computed once per sample
-and cached to prior_cache.npz alongside that sample's frames, mirroring
-DatasetSynth's own resume-by-checking-what-exists philosophy.
+compute_prior's per-frame mask and required strength are expensive to
+reproduce every epoch (it re-runs Detector's full classical pipeline,
+including motion estimation, over the whole clip) -- it is computed once
+per sample and cached to prior_cache.npz alongside that sample's frames,
+mirroring DatasetSynth's own resume-by-checking-what-exists philosophy.
 """
 import json
 import zlib
@@ -25,10 +26,18 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from detector.luminance import relative_luminance
+from detector.motion import estimate_global_shift_checked
 from detector.profiles import ThresholdProfile
-from prior.compute import DEFAULT_N_BINS, FramePrior, compute_prior
+from prior.compute import FramePrior, compute_prior
 
 _TRAIN_PCT = 80
+
+# Bumped whenever prior_cache.npz's contents change meaning. A cache
+# written by an older version is rejected rather than loaded with missing
+# or misinterpreted fields -- the failure would otherwise surface as bad
+# training rather than an error.
+_PRIOR_CACHE_VERSION = 3
 
 
 def clip_split(clip_id: str) -> str:
@@ -49,37 +58,43 @@ def _read_frame_sequence(frames_dir: Path) -> list[np.ndarray]:
 
 
 def _save_prior_cache(cache_path: Path, priors: list[FramePrior]) -> None:
-    n = len(priors)
-    n_bins = next((p.target_histogram.shape[0] for p in priors if p.target_histogram is not None), DEFAULT_N_BINS)
-    has_target = np.array([p.target_histogram is not None for p in priors], dtype=bool)
-    histograms = np.zeros((n, n_bins), dtype=np.float32)
-    for i, p in enumerate(priors):
-        if p.target_histogram is not None:
-            histograms[i] = p.target_histogram
     masks = np.stack([p.mask for p in priors]).astype(bool)
     frame_indices = np.array([p.frame_index for p in priors], dtype=np.int64)
     np.savez_compressed(
         cache_path,
-        has_target=has_target,
-        histograms=histograms,
         masks=masks,
         frame_indices=frame_indices,
+        version=np.array([_PRIOR_CACHE_VERSION], dtype=np.int64),
+        required_strengths=np.array([p.required_strength for p in priors], dtype=np.float32),
     )
 
 
 def _load_prior_cache(cache_path: Path) -> list[FramePrior]:
     with np.load(cache_path) as data:
+        # try/except rather than `"version" in data`: NpzFile supports `in`,
+        # but this also has to work against the CountingNpzFile stub in
+        # test_load_prior_cache_reads_each_key_only_once, which only
+        # implements __getitem__ -- `in` on that falls back to the legacy
+        # int-indexed iteration protocol and raises, not KeyError.
+        try:
+            version = int(data["version"][0])
+        except KeyError:
+            version = 1
+        if version != _PRIOR_CACHE_VERSION:
+            raise ValueError(
+                f"prior cache {cache_path} is version {version}, expected "
+                f"{_PRIOR_CACHE_VERSION}. Delete every data/synthetic/*/prior_cache.npz "
+                f"and let training regenerate them."
+            )
         frame_indices = data["frame_indices"]
-        histograms = data["histograms"]
-        has_target = data["has_target"]
         masks = data["masks"]
+        strengths = data["required_strengths"]
     priors = []
     for i in range(len(frame_indices)):
-        target = histograms[i] if has_target[i] else None
         priors.append(FramePrior(
             frame_index=int(frame_indices[i]),
-            target_histogram=target,
             mask=masks[i],
+            required_strength=float(strengths[i]),
         ))
     return priors
 
@@ -101,9 +116,9 @@ class MitigatorDataset(Dataset):
         if split not in ("train", "val"):
             raise ValueError(f"split must be 'train' or 'val', got {split!r}")
         self.data_dir = Path(data_dir)
-        # Only the FramePrior objects __getitem__ actually reads (the risky,
-        # has-target center frames that landed in self._index) are retained
-        # here -- each FramePrior carries a full-resolution per-pixel mask,
+        # Only the FramePrior objects __getitem__ actually reads (the risky
+        # center frames that landed in self._index) are retained here --
+        # each FramePrior carries a full-resolution per-pixel mask,
         # and most of a sample's frames never end up in self._index (see
         # samples_scanned/samples_contributing below), so keeping every
         # frame's FramePrior around for the dataset's lifetime wastes a lot
@@ -152,7 +167,7 @@ class MitigatorDataset(Dataset):
 
             sample_priors: dict[int, FramePrior] = {}
             for prior in priors:
-                if prior.frame_index in risky_indices and prior.target_histogram is not None:
+                if prior.frame_index in risky_indices:
                     self._index.append((sample_dir, prior.frame_index))
                     sample_priors[prior.frame_index] = prior
 
@@ -178,38 +193,52 @@ class MitigatorDataset(Dataset):
             ],
             axis=-1,
         )
-        clean_center = _read_frame(sample_dir / "clean", frame_index)
 
         return {
             "window": torch.from_numpy(window.transpose(2, 0, 1)).float(),
             "mask": torch.from_numpy(prior.mask[None, :, :].astype(np.float32)),
-            "histogram": torch.from_numpy(prior.target_histogram).float(),
-            "clean": torch.from_numpy(clean_center.transpose(2, 0, 1)).float(),
+            "strength": torch.tensor([prior.required_strength], dtype=torch.float32),
         }
 
     def __getitem__(self, idx: int) -> dict:
         sample_dir, frame_index = self._index[idx]
         example = self._build_example(sample_dir, frame_index)
 
-        # The temporal consistency term needs two consecutive *restored*
+        # The self-supervised temporal term needs two consecutive *restored*
         # frames, which means running the model on a neighbour -- so the
-        # neighbour's full input (window, mask, histogram) travels with the
-        # example rather than being reconstructed in the training loop.
+        # neighbour's full input (window, mask) travels with the example
+        # rather than being reconstructed in the training loop.
         #
-        # Only risky, has-target frames are retained in _priors_by_sample,
-        # so the successor is missing at a segment's last frame. Pairing
-        # such a frame with itself makes the predicted and target luminance
-        # deltas both zero, contributing nothing to the temporal term --
-        # preferable to pairing it with an unrelated frame from elsewhere in
-        # the clip, which would charge the model for a difference that isn't
-        # flicker. Risk segments are contiguous, so this affects one frame
-        # per segment.
+        # Only risky frames are retained in _priors_by_sample, so the
+        # successor is missing at a segment's last frame. Pairing such a
+        # frame with itself makes the predicted luminance delta zero,
+        # contributing nothing to the temporal term -- preferable to pairing
+        # it with an unrelated frame from elsewhere in the clip, which would
+        # charge the model for a difference that isn't flicker. Risk
+        # segments are contiguous, so this affects one frame per segment.
         sample_priors = self._priors_by_sample[sample_dir]
         partner_index = frame_index + 1 if (frame_index + 1) in sample_priors else frame_index
         partner = self._build_example(sample_dir, partner_index)
 
         example["window_partner"] = partner["window"]
         example["mask_partner"] = partner["mask"]
-        example["histogram_partner"] = partner["histogram"]
-        example["clean_partner"] = partner["clean"]
+        example["strength_partner"] = partner["strength"]
+
+        if partner_index == frame_index:
+            # Self-paired at a segment's last frame: no motion by
+            # construction, and trusted precisely because it is not a guess.
+            example["shift"] = torch.zeros(2, dtype=torch.float32)
+            example["shift_trusted"] = torch.ones(1, dtype=torch.float32)
+        else:
+            centre = relative_luminance(_read_frame(sample_dir / "degraded", frame_index))
+            follower = relative_luminance(_read_frame(sample_dir / "degraded", partner_index))
+            # Single call, single threshold decision: estimate_global_shift_checked
+            # is also what estimate_global_shift delegates to, so "shift" here and
+            # what that function would guard can never disagree about which
+            # estimates count as trusted.
+            dx, dy, trusted = estimate_global_shift_checked(centre, follower)
+            example["shift"] = torch.tensor([dx, dy] if trusted else [0.0, 0.0], dtype=torch.float32)
+            example["shift_trusted"] = torch.tensor(
+                [1.0 if trusted else 0.0], dtype=torch.float32
+            )
         return example

@@ -86,31 +86,6 @@ def relative_luminance_torch(frames: torch.Tensor) -> torch.Tensor:
     )
 
 
-def temporal_consistency_loss(
-    pred_a: torch.Tensor,
-    pred_b: torch.Tensor,
-    target_a: torch.Tensor,
-    target_b: torch.Tensor,
-) -> torch.Tensor:
-    """Penalise per-pixel luminance change between two consecutive frames
-    that the ground-truth pair does not have.
-
-    l1_ssim_loss scores each frame on its own, so a model that corrects
-    every frame by the same proportion scores well while leaving the
-    original flicker pattern intact at reduced amplitude -- measured on a
-    real clip as a 60% smaller brightness jump but only 12% fewer
-    transitions, which a viewer still reads as flickering at the same rate.
-
-    Comparing the prediction's frame-to-frame delta against the target's
-    (rather than driving the delta to zero) is what keeps legitimate motion:
-    a camera move or a cut appears in both, cancels, and costs nothing. Only
-    change with no counterpart in the clean pair is charged for.
-    """
-    delta_pred = relative_luminance_torch(pred_b) - relative_luminance_torch(pred_a)
-    delta_target = relative_luminance_torch(target_b) - relative_luminance_torch(target_a)
-    return (delta_pred - delta_target).abs().mean()
-
-
 def warp_by_shift(
     frames: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -155,6 +130,30 @@ def warp_by_shift(
     return warped, valid
 
 
+def _weighted_mean(per_item: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Average `per_item` (B,), weighted per item, normalised by the weight
+    total rather than by B.
+
+    This is what makes a weight of 0 remove an item cleanly instead of
+    merely shrinking its contribution: normalising by B (a plain weighted
+    sum) would still let the remaining items' average drift every time the
+    batch's untrusted/trusted mix changes, since the denominator would
+    count items that contribute nothing to the numerator. Normalising by
+    the weight total instead means a trusted item's result is identical
+    whether it arrived alone or alongside any number of zero-weight items.
+
+    If every weight is 0, `total` is 0 and the item-count-weighted quantity
+    is undefined -- rather than divide by (approximately) zero and return a
+    huge or NaN value, this returns exactly 0, multiplying (not just
+    clamping) `per_item` so the zero also carries no gradient. That is the
+    right answer for a batch with nothing trustworthy to learn from.
+    """
+    total = weights.sum()
+    if total.item() <= 0.0:
+        return (per_item * weights).sum()  # weights are all 0 here, so this is exactly 0
+    return (per_item * weights).sum() / total
+
+
 def self_supervised_loss(
     out_a: torch.Tensor,
     out_b: torch.Tensor,
@@ -167,6 +166,7 @@ def self_supervised_loss(
     lambda_risk: float = 1.0,
     tau: float = 0.02,
     tau_area: float = 0.05,
+    weights: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Loss for two consecutive frames, with no clean reference.
 
@@ -208,37 +208,61 @@ def self_supervised_loss(
     pair, not the outputs: the motion is a property of the footage, and
     using the Detector's own estimate keeps the loss scoring the alignment
     the pass/fail rule was computed on.
+
+    `weights` is an optional (B,) per-item weight applied to `temporal`,
+    `risk` and `soft_area` only -- `fidelity` doesn't depend on `dx`/`dy`,
+    so it has nothing a bad shift estimate could contaminate. `None` (the
+    default) weights every item 1, reproducing the plain per-item mean this
+    function always used. The caller's motivating case is a rejected
+    `estimate_global_shift`: `(dx, dy) = (0, 0)` is both "genuinely did not
+    move" and "refused to guess," and passing a trust weight of 0 for the
+    second case is what keeps that item from charging its (uncompensated)
+    real motion as flicker. The weighting is applied per item BEFORE the
+    batch reduction, not as a single scalar multiplied onto the already-
+    batch-averaged result -- the latter would still let an untrusted item's
+    raw per-item value leak into the average (just diluted), and would also
+    shrink a trusted item's contribution depending on how many untrusted
+    items happen to share its batch, neither of which is "zeroed."
     """
     # Imported locally: training.soft_risk imports relative_luminance_torch
     # from this module at module level, so a top-level import here would be
     # circular.
     from training.soft_risk import risk_penalty, soft_flagged_area
 
-    # All four terms use the SAME reduction convention: average per batch
-    # item first, then average across items. That matters once items in a
-    # batch have unequal valid-pixel counts (e.g. one item's warp clips more
-    # border than another's) -- pooling raw elements across the batch before
-    # averaging would silently down-weight the item with fewer valid pixels
-    # instead of counting every item equally.
-    fidelity = (
+    # All four terms use the SAME per-item reduction convention: compute one
+    # value per batch item first, then reduce across items. That matters
+    # once items in a batch have unequal valid-pixel counts (e.g. one item's
+    # warp clips more border than another's) -- pooling raw elements across
+    # the batch before averaging would silently down-weight the item with
+    # fewer valid pixels instead of counting every item equally.
+    fidelity_per_item = (
         F.l1_loss(out_a, in_a, reduction="none").mean(dim=(1, 2, 3))
         + F.l1_loss(out_b, in_b, reduction="none").mean(dim=(1, 2, 3))
-    ).mean()
+    )
+    fidelity = fidelity_per_item.mean()
 
     warped_out_a, valid = warp_by_shift(out_a, dx, dy)
     luminance_delta = (
         relative_luminance_torch(warped_out_a) - relative_luminance_torch(out_b)
     ).abs()
     per_item_denominator = valid.sum(dim=(1, 2, 3)).clamp(min=1e-6)
-    temporal = ((luminance_delta * valid).sum(dim=(1, 2, 3)) / per_item_denominator).mean()
+    temporal_per_item = (luminance_delta * valid).sum(dim=(1, 2, 3)) / per_item_denominator
 
-    area = soft_flagged_area(warped_out_a, out_b, profile, tau=tau, valid_mask=valid)
-    risk = risk_penalty(area, profile.max_area_ratio, tau_area=tau_area).mean()
+    area_per_item = soft_flagged_area(warped_out_a, out_b, profile, tau=tau, valid_mask=valid)
+    risk_per_item = risk_penalty(area_per_item, profile.max_area_ratio, tau_area=tau_area)
+
+    # weights=None reduces to torch.ones, i.e. _weighted_mean(x, ones) ==
+    # x.mean() -- the exact expression this function used before `weights`
+    # existed, so every existing caller's numbers are unchanged.
+    item_weights = weights if weights is not None else torch.ones_like(temporal_per_item)
+    temporal = _weighted_mean(temporal_per_item, item_weights)
+    risk = _weighted_mean(risk_per_item, item_weights)
+    soft_area = _weighted_mean(area_per_item, item_weights)
 
     return {
         "loss": fidelity + lambda_temporal * temporal + lambda_risk * risk,
         "fidelity": fidelity,
         "temporal": temporal,
         "risk": risk,
-        "soft_area": area.mean(),
+        "soft_area": soft_area,
     }

@@ -1,6 +1,6 @@
 """Evaluation-only inference wrapper: runs a Mitigator model over a
 sequence of frames, sliding a 3-frame window and conditioning each frame on
-PriorCalc's target histogram and risk mask. Not wired into any runtime
+PriorCalc's required strength and risk mask. Not wired into any runtime
 pipeline yet -- Verifier/Fallback/BufferManager integration is a separate,
 later roadmap step (see docs/superpowers/specs/2026-08-03-mitigator-design.md
 section 2). This exists so a trained checkpoint's output can be inspected
@@ -38,7 +38,20 @@ def mitigate_segment(
     # completion, which read as a stuck process rather than a slow one).
     print(f"mitigate_segment: computing detection priors for {len(frames)} frames...", flush=True)
     priors = compute_prior(frames, fps=fps, profile=profile)
-    to_correct = sum(1 for prior in priors if prior.target_histogram is not None)
+    # Strength conditioning is always available (required_strength defaults
+    # to 0.0), unlike the old histogram, which was None until enough
+    # non-masked reference pixels had accumulated -- so "is there
+    # conditioning" is no longer the right question. A frame needs
+    # correction when it sits inside an actual risk segment: required_strength
+    # is only ever set above 0.0 by _assign_segment_strengths for frames of a
+    # detected RiskSegment, so it (together with a non-empty mask) is exactly
+    # that signal. mask alone is not enough -- Detector conservatively masks
+    # the whole frame during its uncertain warm-up window even when nothing
+    # risky has actually been found, and required_strength stays 0.0 for
+    # those frames. mitigate_frame's hard blend would return the input
+    # byte-for-byte wherever mask == 0 regardless of strength, so this gate
+    # is purely about skipping wasted forward passes, not pixel correctness.
+    to_correct = sum(1 for prior in priors if prior.required_strength > 0.0 and prior.mask.any())
     print(f"mitigate_segment: priors ready, {to_correct} of {len(frames)} frames need correction...", flush=True)
     was_training = model.training
     model.eval()
@@ -61,8 +74,8 @@ def mitigate_segment(
     try:
         with torch.no_grad():
             for prior in priors:
-                if prior.target_histogram is None:
-                    continue  # no conditioning available -- pass through unchanged
+                if not (prior.required_strength > 0.0 and prior.mask.any()):
+                    continue  # not in a risk segment -- nothing to correct, would be a wasted forward pass
 
                 i = prior.frame_index
                 prev_idx = max(0, i - 1)
@@ -92,9 +105,9 @@ def mitigate_segment(
 
                 window = torch.from_numpy(window_proc.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
                 mask = torch.from_numpy(mask_proc[None, None, :, :]).to(device)
-                histogram = torch.from_numpy(prior.target_histogram).float().unsqueeze(0).to(device)
+                strength = torch.tensor([[prior.required_strength]], device=device)
 
-                restored = mitigate_frame(window, mask, histogram, model)
+                restored = mitigate_frame(window, mask, strength, model)
                 if not torch.isfinite(restored).all():
                     continue  # NaN/Inf from the model -- keep the original frame, never propagate garbage
                 restored_frame = restored.squeeze(0).permute(1, 2, 0).cpu().numpy()

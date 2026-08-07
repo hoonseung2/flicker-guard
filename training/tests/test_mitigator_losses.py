@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from training.mitigator_losses import l1_ssim_loss, psnr, ssim, temporal_consistency_loss
+from training.mitigator_losses import l1_ssim_loss, psnr, ssim
 
 
 def test_ssim_of_identical_images_is_one():
@@ -60,50 +60,6 @@ def test_torch_luminance_matches_the_detector_formula():
     expected = relative_luminance(rgb)
     actual = relative_luminance_torch(torch.from_numpy(rgb.transpose(2, 0, 1))[None])
     assert torch.allclose(actual[0, 0], torch.from_numpy(expected), atol=1e-6)
-
-
-def test_temporal_loss_is_zero_when_prediction_matches_target_pair():
-    a = torch.rand(2, 3, 8, 8)
-    b = torch.rand(2, 3, 8, 8)
-    assert temporal_consistency_loss(a, b, a, b).item() == pytest.approx(0.0, abs=1e-6)
-
-
-def test_temporal_loss_penalises_flicker_the_target_does_not_have():
-    # Target is static between the two frames; the prediction jumps. This
-    # is exactly the residual flicker the per-frame L1/SSIM loss cannot see.
-    static = torch.full((1, 3, 8, 8), 0.4)
-    flickering = torch.full((1, 3, 8, 8), 0.8)
-    assert temporal_consistency_loss(static, flickering, static, static).item() > 0.1
-
-
-def test_temporal_loss_preserves_real_motion_in_the_target():
-    # The target itself brightens (a camera move, a genuine cut). A
-    # prediction that reproduces that change must NOT be penalised --
-    # otherwise the loss would flatten legitimate content along with the
-    # flicker.
-    dark = torch.full((1, 3, 8, 8), 0.3)
-    bright = torch.full((1, 3, 8, 8), 0.9)
-    assert temporal_consistency_loss(dark, bright, dark, bright).item() == pytest.approx(0.0, abs=1e-6)
-
-
-def test_temporal_loss_decreases_as_residual_flicker_shrinks():
-    static = torch.full((1, 3, 8, 8), 0.4)
-    strong = temporal_consistency_loss(static, torch.full((1, 3, 8, 8), 0.9), static, static)
-    weak = temporal_consistency_loss(static, torch.full((1, 3, 8, 8), 0.5), static, static)
-    assert weak.item() < strong.item()
-
-
-def test_temporal_loss_gradients_flow_and_stay_finite_out_of_range():
-    # `restored = center + delta` is unclamped, so predictions can leave
-    # [0, 1]. The sRGB curve's fractional exponent produces NaN on a
-    # negative base, which would silently poison every weight.
-    pred_a = torch.full((1, 3, 4, 4), -0.2, requires_grad=True)
-    pred_b = torch.full((1, 3, 4, 4), 1.4, requires_grad=True)
-    target = torch.full((1, 3, 4, 4), 0.5)
-    loss = temporal_consistency_loss(pred_a, pred_b, target, target)
-    loss.backward()
-    assert torch.isfinite(loss).all()
-    assert torch.isfinite(pred_b.grad).all()
 
 
 def test_warp_by_shift_matches_compensate_shift_for_integer_shifts():
@@ -393,3 +349,64 @@ def test_flattening_with_a_tight_area_limit_still_charges_risk():
     terms = self_supervised_loss(flat, flat, in_a, in_b, torch.zeros(1), torch.zeros(1),
                                  tight_profile)
     assert terms["risk"].item() > 0.0
+
+
+def test_weights_none_reproduces_the_unweighted_result():
+    # weights defaults to None, which must be numerically identical to
+    # every call above that never passes it -- this is the backward
+    # compatibility contract the `weights` argument was added under.
+    from training.mitigator_losses import self_supervised_loss
+
+    in_a, in_b = _flickering_pair()
+    unweighted = self_supervised_loss(in_a, in_b, in_a, in_b, torch.zeros(1), torch.zeros(1), _profile())
+    explicit_ones = self_supervised_loss(
+        in_a, in_b, in_a, in_b, torch.zeros(1), torch.zeros(1), _profile(),
+        weights=torch.ones(1),
+    )
+    for key in ("loss", "fidelity", "temporal", "risk", "soft_area"):
+        assert unweighted[key].item() == pytest.approx(explicit_ones[key].item(), abs=1e-6)
+
+
+def test_a_zero_weighted_items_terms_do_not_dilute_or_leak_into_the_others():
+    # A weight of 0 must remove an item from temporal/risk/soft_area
+    # entirely -- not merely discount it -- and a weighted item's own
+    # result must not depend on how many zero-weight items share its batch.
+    # This is the mechanism training.train_mitigator.compute_batch_losses
+    # relies on to honour shift_trusted per item rather than as a single
+    # scalar over the whole batch (code review finding: a batch-wide
+    # trusted.mean() gate both let an untrusted item's raw value leak in at
+    # reduced weight and shrank a trusted item's own contribution depending
+    # on batch composition).
+    from training.mitigator_losses import self_supervised_loss
+
+    g = torch.Generator().manual_seed(9)
+    a0 = torch.rand(1, 3, 32, 32, generator=g) * 0.2
+    b0 = (a0 + 0.7).clamp(0, 1)
+    a1 = torch.rand(1, 3, 32, 32, generator=g) * 0.2
+    b1 = (a1 + 0.7).clamp(0, 1)
+
+    alone = self_supervised_loss(a0, b0, a0, b0, torch.zeros(1), torch.zeros(1), _profile())
+
+    a = torch.cat([a0, a1], dim=0)
+    b = torch.cat([b0, b1], dim=0)
+    mixed = self_supervised_loss(
+        a, b, a, b, torch.zeros(2), torch.zeros(2), _profile(),
+        weights=torch.tensor([1.0, 0.0]),
+    )
+
+    assert mixed["temporal"].item() == pytest.approx(alone["temporal"].item(), abs=1e-5)
+    assert mixed["risk"].item() == pytest.approx(alone["risk"].item(), abs=1e-5)
+    assert mixed["soft_area"].item() == pytest.approx(alone["soft_area"].item(), abs=1e-5)
+
+
+def test_all_weights_zero_returns_zero_not_nan():
+    from training.mitigator_losses import self_supervised_loss
+
+    in_a, in_b = _flickering_pair()
+    terms = self_supervised_loss(
+        in_a, in_b, in_a, in_b, torch.zeros(1), torch.zeros(1), _profile(),
+        weights=torch.zeros(1),
+    )
+    assert terms["temporal"].item() == pytest.approx(0.0, abs=1e-6)
+    assert terms["risk"].item() == pytest.approx(0.0, abs=1e-6)
+    assert terms["soft_area"].item() == pytest.approx(0.0, abs=1e-6)

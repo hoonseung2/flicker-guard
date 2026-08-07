@@ -1,9 +1,15 @@
+from pathlib import Path
+
 import pytest
 import torch
 
+from detector.profiles import load_profile
 from mitigator.arch import MitigatorNet
-from training.mitigator_losses import l1_ssim_loss
 from training.train_mitigator import load_checkpoint, main, save_checkpoint, train_one_epoch, _make_patch_collate_fn
+
+# Shared across tests that just need *a* profile and don't care which --
+# real training always passes one explicitly via --profile.
+_PROFILE = load_profile(Path("configs/profiles/itu.json"))
 
 
 class _FixedBatchDataset(torch.utils.data.Dataset):
@@ -15,8 +21,7 @@ class _FixedBatchDataset(torch.utils.data.Dataset):
         torch.manual_seed(0)
         self.window = torch.rand(9, h, w)
         self.mask = torch.ones(1, h, w)
-        self.histogram = torch.rand(64)
-        self.clean = torch.rand(3, h, w)
+        self.strength = torch.rand(1)
         self.n = n
 
     def __len__(self):
@@ -26,14 +31,16 @@ class _FixedBatchDataset(torch.utils.data.Dataset):
         return {
             "window": self.window,
             "mask": self.mask,
-            "histogram": self.histogram,
-            "clean": self.clean,
-            # compute_losses restores the centre frame and its temporal
+            "strength": self.strength,
+            # compute_batch_losses restores the centre frame and its temporal
             # partner together, so every example must carry both.
             "window_partner": self.window,
             "mask_partner": self.mask,
-            "histogram_partner": self.histogram,
-            "clean_partner": self.clean,
+            "strength_partner": self.strength,
+            # Required by compute_batch_losses's self-supervised loss --
+            # zero shift, trusted, so the motion-dependent terms are live.
+            "shift": torch.zeros(2),
+            "shift_trusted": torch.ones(1),
         }
 
 
@@ -43,10 +50,10 @@ def test_train_one_epoch_reduces_loss_over_many_epochs():
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
     dataloader = torch.utils.data.DataLoader(_FixedBatchDataset(), batch_size=4)
 
-    first_epoch_loss = train_one_epoch(model, optimizer, dataloader, device="cpu")
+    first_epoch_loss = train_one_epoch(model, optimizer, dataloader, device="cpu", profile=_PROFILE)
     last_epoch_loss = first_epoch_loss
     for _ in range(19):
-        last_epoch_loss = train_one_epoch(model, optimizer, dataloader, device="cpu")
+        last_epoch_loss = train_one_epoch(model, optimizer, dataloader, device="cpu", profile=_PROFILE)
 
     assert last_epoch_loss < first_epoch_loss
 
@@ -55,7 +62,7 @@ def test_train_one_epoch_returns_finite_loss():
     model = MitigatorNet()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     dataloader = torch.utils.data.DataLoader(_FixedBatchDataset(), batch_size=4)
-    loss = train_one_epoch(model, optimizer, dataloader, device="cpu")
+    loss = train_one_epoch(model, optimizer, dataloader, device="cpu", profile=_PROFILE)
     assert loss == loss  # NaN check (NaN != NaN)
     assert loss != float("inf")
 
@@ -65,8 +72,8 @@ def test_checkpoint_save_and_load_restores_model_and_optimizer_state(tmp_path):
     model = MitigatorNet()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     dataloader = torch.utils.data.DataLoader(_FixedBatchDataset(), batch_size=4)
-    train_one_epoch(model, optimizer, dataloader, device="cpu")
-    train_one_epoch(model, optimizer, dataloader, device="cpu")
+    train_one_epoch(model, optimizer, dataloader, device="cpu", profile=_PROFILE)
+    train_one_epoch(model, optimizer, dataloader, device="cpu", profile=_PROFILE)
 
     checkpoint_path = tmp_path / "checkpoint.pt"
     save_checkpoint(checkpoint_path, model, optimizer, epoch=2, best_val_loss=0.5)
@@ -111,7 +118,7 @@ def test_checkpoint_resume_round_trip_does_not_raise_on_cpu(tmp_path):
     model.to("cpu")
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     dataloader = torch.utils.data.DataLoader(_FixedBatchDataset(), batch_size=4)
-    train_one_epoch(model, optimizer, dataloader, device="cpu")
+    train_one_epoch(model, optimizer, dataloader, device="cpu", profile=_PROFILE)
 
     checkpoint_path = tmp_path / "checkpoint.pt"
     save_checkpoint(checkpoint_path, model, optimizer, epoch=0, best_val_loss=0.5)
@@ -139,7 +146,7 @@ def test_checkpoint_resume_round_trip_keeps_optimizer_state_on_model_device_gpu(
     model.to("cuda")
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     dataloader = torch.utils.data.DataLoader(_FixedBatchDataset(), batch_size=4)
-    train_one_epoch(model, optimizer, dataloader, device="cuda")
+    train_one_epoch(model, optimizer, dataloader, device="cuda", profile=_PROFILE)
 
     checkpoint_path = tmp_path / "checkpoint.pt"
     save_checkpoint(checkpoint_path, model, optimizer, epoch=0, best_val_loss=0.5)
@@ -156,7 +163,7 @@ def test_checkpoint_resume_round_trip_keeps_optimizer_state_on_model_device_gpu(
 
     # The real bug surfaced on the next optimizer.step() after resume, not
     # on load itself -- exercise one more training step to be sure.
-    train_one_epoch(new_model, new_optimizer, dataloader, device="cuda")
+    train_one_epoch(new_model, new_optimizer, dataloader, device="cuda", profile=_PROFILE)
 
 
 class _FakeMitigatorDataset(torch.utils.data.Dataset):
@@ -167,8 +174,7 @@ class _FakeMitigatorDataset(torch.utils.data.Dataset):
     def __init__(self, *args, **kwargs):
         self.window = torch.rand(9, 8, 8)
         self.mask = torch.ones(1, 8, 8)
-        self.histogram = torch.rand(64)
-        self.clean = torch.rand(3, 8, 8)
+        self.strength = torch.rand(1)
         self.samples_scanned = 1
         self.samples_contributing = 1
 
@@ -179,14 +185,14 @@ class _FakeMitigatorDataset(torch.utils.data.Dataset):
         return {
             "window": self.window,
             "mask": self.mask,
-            "histogram": self.histogram,
-            "clean": self.clean,
-            # compute_losses restores the centre frame and its temporal
+            "strength": self.strength,
+            # compute_batch_losses restores the centre frame and its temporal
             # partner together, so every example must carry both.
             "window_partner": self.window,
             "mask_partner": self.mask,
-            "histogram_partner": self.histogram,
-            "clean_partner": self.clean,
+            "strength_partner": self.strength,
+            "shift": torch.zeros(2),
+            "shift_trusted": torch.ones(1),
         }
 
 
@@ -205,8 +211,12 @@ def test_main_resume_does_not_clobber_best_pt_with_worse_checkpoint(tmp_path, mo
     # would have restored.
     scripted_losses = iter([0.5, 0.2, 0.3])
 
-    def _fake_evaluate(model, dataloader, device, lambda_temporal=0.0):
-        return {"loss": next(scripted_losses), "reconstruction": 0.0, "temporal": 0.0, "psnr": 0.0}
+    def _fake_evaluate(model, dataloader, device, profile, lambda_temporal=1.0,
+                        lambda_risk=1.0, tau=0.02, tau_area=0.05):
+        return {
+            "loss": next(scripted_losses), "fidelity": 0.0, "temporal": 0.0,
+            "risk": 0.0, "soft_area": 0.0, "trusted_fraction": 1.0,
+        }
 
     monkeypatch.setattr(train_mitigator_module, "evaluate", _fake_evaluate)
 
@@ -249,12 +259,12 @@ class _VariableShapeMitigatorDataset(torch.utils.data.Dataset):
         return {
             "window": torch.rand(9, h, w),
             "mask": torch.ones(1, h, w),
-            "histogram": torch.rand(64),
-            "clean": torch.rand(3, h, w),
+            "strength": torch.rand(1),
             "window_partner": torch.rand(9, h, w),
             "mask_partner": torch.ones(1, h, w),
-            "histogram_partner": torch.rand(64),
-            "clean_partner": torch.rand(3, h, w),
+            "strength_partner": torch.rand(1),
+            "shift": torch.zeros(2),
+            "shift_trusted": torch.ones(1),
         }
 
 
@@ -292,17 +302,20 @@ def test_train_one_epoch_raises_clearly_on_nan_loss(monkeypatch):
     # would corrupt every weight via backward() on NaN.
     import training.train_mitigator as train_mitigator_module
 
-    def _nan_loss(pred, target):
-        return pred.sum() * float("nan")
+    def _nan_self_supervised_loss(out_a, out_b, in_a, in_b, dx, dy, profile,
+                                   lambda_temporal=1.0, lambda_risk=1.0,
+                                   tau=0.02, tau_area=0.05, weights=None):
+        nan = torch.tensor(float("nan"))
+        return {"loss": nan, "fidelity": nan, "temporal": nan, "risk": nan, "soft_area": nan}
 
-    monkeypatch.setattr(train_mitigator_module, "l1_ssim_loss", _nan_loss)
+    monkeypatch.setattr(train_mitigator_module, "self_supervised_loss", _nan_self_supervised_loss)
 
     model = MitigatorNet()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     dataloader = torch.utils.data.DataLoader(_FixedBatchDataset(), batch_size=4)
 
     with pytest.raises(RuntimeError, match="NaN"):
-        train_one_epoch(model, optimizer, dataloader, device="cpu")
+        train_one_epoch(model, optimizer, dataloader, device="cpu", profile=_PROFILE)
 
 
 def test_patch_collate_fn_crops_window_mask_clean_to_requested_size():
@@ -415,7 +428,7 @@ def test_train_one_epoch_with_patch_collate_fn():
         collate_fn=collate_fn,
     )
 
-    loss = train_one_epoch(model, optimizer, dataloader, device="cpu")
+    loss = train_one_epoch(model, optimizer, dataloader, device="cpu", profile=_PROFILE)
     assert loss == loss  # finite check (NaN != NaN)
     assert loss != float("inf")
 
@@ -499,15 +512,14 @@ def test_patch_collate_crops_partner_tensors_with_the_same_offset():
 
 
 class _FlickeringPairDataset(torch.utils.data.Dataset):
-    """A pair whose clean frames are identical but whose degraded frames
-    differ in brightness -- i.e. pure flicker, nothing else."""
+    """A pair built from one shared base frame, degraded into a dark centre
+    frame and a bright partner -- i.e. pure flicker, nothing else."""
 
     def __init__(self, h=16, w=16):
         torch.manual_seed(0)
         base = torch.rand(3, h, w) * 0.4 + 0.2
-        self.clean = base
         self.mask = torch.ones(1, h, w)
-        self.histogram = torch.rand(64)
+        self.strength = torch.rand(1)
         self.dark = torch.cat([base, base, base], dim=0)
         self.bright = torch.cat([base, (base + 0.4), (base + 0.4)], dim=0)
 
@@ -517,33 +529,41 @@ class _FlickeringPairDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return {
             "window": self.dark, "mask": self.mask,
-            "histogram": self.histogram, "clean": self.clean,
+            "strength": self.strength,
             "window_partner": self.bright, "mask_partner": self.mask,
-            "histogram_partner": self.histogram, "clean_partner": self.clean,
+            "strength_partner": self.strength,
+            "shift": torch.zeros(2), "shift_trusted": torch.ones(1),
         }
 
 
-def test_lambda_temporal_zero_reproduces_the_reconstruction_only_objective():
-    from training.train_mitigator import compute_losses
+def test_lambda_temporal_and_risk_zero_reduces_to_fidelity_only():
+    # With both motion-dependent weights at 0, compute_batch_losses's "loss"
+    # collapses to the fidelity term alone -- fidelity + 0 * temporal
+    # + 0 * risk == fidelity.
+    from training.train_mitigator import compute_batch_losses
 
     model = MitigatorNet()
     batch = torch.utils.data.default_collate([_FlickeringPairDataset()[0]])
-    losses = compute_losses(batch, model, device="cpu", lambda_temporal=0.0)
-    assert losses["loss"].item() == pytest.approx(losses["reconstruction"].item(), abs=1e-6)
+    losses = compute_batch_losses(
+        batch, model, device="cpu", profile=_PROFILE,
+        lambda_temporal=0.0, lambda_risk=0.0,
+    )
+    assert losses["loss"].item() == pytest.approx(losses["fidelity"].item(), abs=1e-6)
 
 
-def test_temporal_term_charges_for_flicker_the_clean_pair_does_not_have():
-    # Both clean frames are identical, so any brightness difference between
-    # the two restored frames is pure residual flicker and must cost
-    # something -- this is precisely what the per-frame reconstruction loss
-    # cannot see.
-    from training.train_mitigator import compute_losses
+def test_temporal_term_charges_for_flicker_the_partner_pair_has():
+    # The degraded pair's centre frames differ only in brightness (pure
+    # flicker), so the temporal term -- which compares the restored pair's
+    # own frame-to-frame luminance delta, not a delta against a clean
+    # reference -- must charge for it, and the combined loss must exceed
+    # fidelity alone as a result.
+    from training.train_mitigator import compute_batch_losses
 
     model = MitigatorNet()
     batch = torch.utils.data.default_collate([_FlickeringPairDataset()[0]])
-    losses = compute_losses(batch, model, device="cpu", lambda_temporal=1.0)
+    losses = compute_batch_losses(batch, model, device="cpu", profile=_PROFILE)
     assert losses["temporal"].item() > 0.0
-    assert losses["loss"].item() > losses["reconstruction"].item()
+    assert losses["loss"].item() > losses["fidelity"].item()
 
 
 def test_patch_collate_fn_is_picklable():
@@ -564,3 +584,177 @@ def test_patch_collate_fn_is_picklable():
         "clean_partner": torch.rand(3, 16, 16), "histogram_partner": torch.zeros(64),
     }
     assert restored([item])["window"].shape == (1, 9, 8, 8)
+
+
+class _SelfSupervisedBatchDataset(torch.utils.data.Dataset):
+    """A flickering pair with everything the self-supervised loss needs."""
+
+    def __init__(self, h=16, w=16, n=4):
+        torch.manual_seed(0)
+        dark = torch.rand(3, h, w) * 0.2
+        bright = (dark + 0.7).clamp(0, 1)
+        self.window = torch.cat([dark, dark, bright], dim=0)
+        self.window_partner = torch.cat([dark, bright, bright], dim=0)
+        self.mask = torch.ones(1, h, w)
+        self.strength = torch.tensor([0.6])
+        self.n = n
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        return {
+            "window": self.window, "mask": self.mask, "strength": self.strength,
+            "window_partner": self.window_partner, "mask_partner": self.mask,
+            "strength_partner": self.strength,
+            "shift": torch.zeros(2), "shift_trusted": torch.ones(1),
+        }
+
+
+def test_train_one_epoch_runs_on_the_self_supervised_loss():
+    from training.train_mitigator import train_one_epoch
+
+    torch.manual_seed(0)
+    model = MitigatorNet()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    loader = torch.utils.data.DataLoader(_SelfSupervisedBatchDataset(), batch_size=2)
+    profile = load_profile(Path("configs/profiles/itu.json"))
+
+    loss = train_one_epoch(model, optimizer, loader, device="cpu", profile=profile)
+    assert loss == loss  # NaN check
+    assert loss > 0.0
+
+
+def test_evaluate_reports_every_loss_term():
+    # The training log is how the fidelity/risk trade-off is watched. A
+    # combined number alone hides which way it is going, and lambda_temporal
+    # is the over-correction knob -- measured, not assumed.
+    from training.train_mitigator import evaluate
+
+    model = MitigatorNet()
+    loader = torch.utils.data.DataLoader(_SelfSupervisedBatchDataset(), batch_size=1)
+    profile = load_profile(Path("configs/profiles/itu.json"))
+
+    metrics = evaluate(model, loader, device="cpu", profile=profile)
+    for key in ("loss", "fidelity", "temporal", "risk", "soft_area", "trusted_fraction"):
+        assert key in metrics
+
+
+def test_an_untrusted_shift_drops_the_temporal_and_risk_terms():
+    # A rejected phase-correlation estimate is indistinguishable from "no
+    # motion" once it is a zero shift, so on a rejected pan both terms would
+    # charge real camera movement as flicker. The example carries a trust
+    # flag; the loop must honour it.
+    from training.train_mitigator import compute_batch_losses
+
+    model = MitigatorNet()
+    profile = load_profile(Path("configs/profiles/itu.json"))
+    batch = torch.utils.data.default_collate([_SelfSupervisedBatchDataset()[0]])
+    batch["shift_trusted"] = torch.zeros(1, 1)
+
+    terms = compute_batch_losses(batch, model, "cpu", profile)
+    assert terms["temporal"].item() == pytest.approx(0.0, abs=1e-6)
+    assert terms["risk"].item() == pytest.approx(0.0, abs=1e-6)
+    assert terms["fidelity"].item() > 0.0 or terms["loss"].item() >= 0.0
+
+
+class _DistinctPairDataset(torch.utils.data.Dataset):
+    """A flickering pair whose content is seed-distinguishable from any
+    other instance of this class -- lets a test tell whether one item's
+    computed terms leaked information from a different item sharing its
+    batch."""
+
+    def __init__(self, seed, h=16, w=16):
+        g = torch.Generator().manual_seed(seed)
+        dark = torch.rand(3, h, w, generator=g) * 0.2
+        bright = (dark + 0.7).clamp(0, 1)
+        self.window = torch.cat([dark, dark, bright], dim=0)
+        self.window_partner = torch.cat([dark, bright, bright], dim=0)
+        self.mask = torch.ones(1, h, w)
+        self.strength = torch.tensor([0.6])
+
+    def item(self, shift_trusted: float) -> dict:
+        return {
+            "window": self.window, "mask": self.mask, "strength": self.strength,
+            "window_partner": self.window_partner, "mask_partner": self.mask,
+            "strength_partner": self.strength,
+            "shift": torch.zeros(2), "shift_trusted": torch.tensor([shift_trusted]),
+        }
+
+
+def test_a_trusted_items_terms_do_not_depend_on_an_untrusted_batchmate():
+    # Important-1 fix (code review, round 1): the trust gate used to be a
+    # single batch-wide scalar (trusted.mean()) multiplied onto terms that
+    # self_supervised_loss had ALREADY averaged across the batch. That both
+    # let the untrusted item's raw value leak into the average at reduced
+    # weight (never truly zeroed) and shrank the trusted item's own
+    # contribution depending on how many untrusted items happened to share
+    # its batch. The fix moves the gating inside self_supervised_loss, as a
+    # per-item weight applied before the batch reduction -- this pins the
+    # property that fix must deliver: a trusted item's temporal/risk in a
+    # mixed batch must be bit-for-bit what it would be alone.
+    #
+    # MitigatorNet uses GroupNorm(1, ...), which normalises each sample
+    # independently (no cross-sample statistics like BatchNorm), so the
+    # model's own output for one item is unaffected by what else is in its
+    # batch -- any difference here can only come from the loss reduction.
+    from training.train_mitigator import compute_batch_losses
+
+    model = MitigatorNet()
+    profile = load_profile(Path("configs/profiles/itu.json"))
+
+    trusted_item = _DistinctPairDataset(seed=1).item(shift_trusted=1.0)
+    untrusted_item = _DistinctPairDataset(seed=2).item(shift_trusted=0.0)
+
+    alone = compute_batch_losses(
+        torch.utils.data.default_collate([trusted_item]), model, "cpu", profile,
+    )
+    mixed = compute_batch_losses(
+        torch.utils.data.default_collate([trusted_item, untrusted_item]), model, "cpu", profile,
+    )
+
+    assert mixed["temporal"].item() == pytest.approx(alone["temporal"].item(), abs=1e-5)
+    assert mixed["risk"].item() == pytest.approx(alone["risk"].item(), abs=1e-5)
+
+
+def test_soft_area_matches_alone_and_trusted_fraction_reports_the_mix():
+    # Important-2 fix (code review, round 1): soft_area was reported
+    # ungated -- an operator reading val_soft_area could not tell how much
+    # of it rested on rejected (mis-warped) pairs. Fixed the same way as
+    # temporal/risk: gated per item inside self_supervised_loss, plus a new
+    # trusted_fraction key so the operator can see how much of the batch
+    # that number actually rests on.
+    from training.train_mitigator import compute_batch_losses
+
+    model = MitigatorNet()
+    profile = load_profile(Path("configs/profiles/itu.json"))
+
+    trusted_item = _DistinctPairDataset(seed=1).item(shift_trusted=1.0)
+    untrusted_item = _DistinctPairDataset(seed=2).item(shift_trusted=0.0)
+
+    alone = compute_batch_losses(
+        torch.utils.data.default_collate([trusted_item]), model, "cpu", profile,
+    )
+    mixed = compute_batch_losses(
+        torch.utils.data.default_collate([trusted_item, untrusted_item]), model, "cpu", profile,
+    )
+
+    assert mixed["soft_area"].item() == pytest.approx(alone["soft_area"].item(), abs=1e-5)
+    assert mixed["trusted_fraction"].item() == pytest.approx(0.5, abs=1e-6)
+
+
+def test_soft_area_and_trusted_fraction_are_zero_when_nothing_is_trusted():
+    # Dividing by zero trusted examples must report 0.0, not NaN or a
+    # division blow-up -- and trusted_fraction=0.0 is what tells the
+    # operator that the 0.0 soft_area means "no usable data," not "no
+    # flagged pixels."
+    from training.train_mitigator import compute_batch_losses
+
+    model = MitigatorNet()
+    profile = load_profile(Path("configs/profiles/itu.json"))
+    batch = torch.utils.data.default_collate([_SelfSupervisedBatchDataset()[0]])
+    batch["shift_trusted"] = torch.zeros(1, 1)
+
+    terms = compute_batch_losses(batch, model, "cpu", profile)
+    assert terms["soft_area"].item() == pytest.approx(0.0, abs=1e-6)
+    assert terms["trusted_fraction"].item() == pytest.approx(0.0, abs=1e-6)
