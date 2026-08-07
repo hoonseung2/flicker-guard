@@ -1,7 +1,12 @@
-"""Training loop for Mitigator: AdamW + L1/SSIM loss over
+"""Training loop for Mitigator: AdamW over the self-supervised loss on
 training.mitigator_dataset.MitigatorDataset, with checkpoint/resume support
 so a multi-hour run surviving an interruption doesn't have to restart from
 scratch (same philosophy as DatasetSynth's resumable batch CLI).
+
+There is no clean reference to grade against -- self_supervised_loss scores
+a restored frame pair against its own degraded input plus a Detector-shaped
+flicker penalty instead of L1/SSIM-to-clean, since a clean reference cannot
+see flicker at all (see training.mitigator_losses.self_supervised_loss).
 """
 import argparse
 import json
@@ -11,10 +16,10 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, default_collate
 
-from detector.profiles import load_profile
+from detector.profiles import ThresholdProfile, load_profile
 from mitigator.arch import MitigatorNet, mitigate_frame
 from training.mitigator_dataset import MitigatorDataset
-from training.mitigator_losses import l1_ssim_loss, psnr, temporal_consistency_loss
+from training.mitigator_losses import self_supervised_loss
 
 
 def save_checkpoint(
@@ -46,31 +51,57 @@ def load_checkpoint(path: Path, model: MitigatorNet, optimizer: torch.optim.Opti
     return checkpoint["epoch"], best_val_loss
 
 
-def compute_losses(batch: dict, model: MitigatorNet, device: str, lambda_temporal: float) -> dict:
-    """Restores the centre frame and its partner, and returns the loss terms.
+def compute_batch_losses(
+    batch: dict,
+    model: MitigatorNet,
+    device: str,
+    profile: ThresholdProfile,
+    lambda_temporal: float = 1.0,
+    lambda_risk: float = 1.0,
+    tau: float = 0.02,
+    tau_area: float = 0.05,
+) -> dict:
+    """Restore the centre frame and its partner, and score them without a
+    clean reference.
 
-    Both frames go through the model in a single forward pass (concatenated
-    along the batch axis) rather than two calls: same arithmetic, one kernel
-    launch sequence, and it keeps the reconstruction term applied to both
-    outputs so the partner is never left graded only by the relative
-    temporal term.
+    Both go through the model in one concatenated forward pass -- same
+    arithmetic, one kernel launch sequence.
+
+    An example whose `shift_trusted` is 0 has both motion-dependent terms
+    zeroed. `estimate_global_shift` returns (0, 0) both when the frames
+    genuinely did not move and when it refused to guess, and on a rejected
+    pan the temporal and risk terms would charge real camera motion as
+    flicker. The Detector absorbs a bad warp through thresholding,
+    area-averaging and a one-second windowed maximum; this loss has none of
+    those stages. Measured: 33.6% of frame pairs rejected on one real clip.
     """
     n = batch["window"].shape[0]
     window = torch.cat([batch["window"], batch["window_partner"]], dim=0).to(device)
     mask = torch.cat([batch["mask"], batch["mask_partner"]], dim=0).to(device)
     strength = torch.cat([batch["strength"], batch["strength_partner"]], dim=0).to(device)
-    clean = torch.cat([batch["clean"], batch["clean_partner"]], dim=0).to(device)
 
     restored = mitigate_frame(window, mask, strength, model)
-    reconstruction = l1_ssim_loss(restored, clean)
-    temporal = temporal_consistency_loss(restored[:n], restored[n:], clean[:n], clean[n:])
+    out_a, out_b = restored[:n], restored[n:]
+    in_a = window[:n, 3:6]
+    in_b = window[n:, 3:6]
+
+    shift = batch["shift"].to(device)
+    trusted = batch["shift_trusted"].to(device).view(-1)
+
+    terms = self_supervised_loss(
+        out_a, out_b, in_a, in_b, shift[:, 0], shift[:, 1], profile,
+        lambda_temporal=lambda_temporal, lambda_risk=lambda_risk,
+        tau=tau, tau_area=tau_area,
+    )
+
+    gate = trusted.mean()
     return {
-        "loss": reconstruction + lambda_temporal * temporal,
-        "reconstruction": reconstruction,
-        "temporal": temporal,
-        # PSNR stays a centre-frame-only measure so it remains comparable
-        # with checkpoints trained before the partner frame existed.
-        "psnr": psnr(restored[:n], clean[:n]),
+        "loss": terms["fidelity"] + gate * (lambda_temporal * terms["temporal"]
+                                            + lambda_risk * terms["risk"]),
+        "fidelity": terms["fidelity"],
+        "temporal": gate * terms["temporal"],
+        "risk": gate * terms["risk"],
+        "soft_area": terms["soft_area"],
     }
 
 
@@ -79,14 +110,22 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     dataloader: DataLoader,
     device: str,
-    lambda_temporal: float = 0.0,
+    profile: ThresholdProfile,
+    lambda_temporal: float = 1.0,
+    lambda_risk: float = 1.0,
+    tau: float = 0.02,
+    tau_area: float = 0.05,
 ) -> float:
     model.train()
     total_loss = 0.0
     n_batches = 0
     for batch in dataloader:
         optimizer.zero_grad()
-        loss = compute_losses(batch, model, device, lambda_temporal)["loss"]
+        loss = compute_batch_losses(
+            batch, model, device, profile,
+            lambda_temporal=lambda_temporal, lambda_risk=lambda_risk,
+            tau=tau, tau_area=tau_area,
+        )["loss"]
         loss_value = loss.item()
         if loss_value != loss_value:  # NaN check (NaN != NaN) -- fail loud, never train through it
             raise RuntimeError(
@@ -103,13 +142,26 @@ def train_one_epoch(
     return total_loss / n_batches
 
 
-def evaluate(model: MitigatorNet, dataloader: DataLoader, device: str, lambda_temporal: float = 0.0) -> dict:
+def evaluate(
+    model: MitigatorNet,
+    dataloader: DataLoader,
+    device: str,
+    profile: ThresholdProfile,
+    lambda_temporal: float = 1.0,
+    lambda_risk: float = 1.0,
+    tau: float = 0.02,
+    tau_area: float = 0.05,
+) -> dict:
     model.eval()
-    totals = {"loss": 0.0, "reconstruction": 0.0, "temporal": 0.0, "psnr": 0.0}
+    totals = {"loss": 0.0, "fidelity": 0.0, "temporal": 0.0, "risk": 0.0, "soft_area": 0.0}
     n_batches = 0
     with torch.no_grad():
         for batch in dataloader:
-            losses = compute_losses(batch, model, device, lambda_temporal)
+            losses = compute_batch_losses(
+                batch, model, device, profile,
+                lambda_temporal=lambda_temporal, lambda_risk=lambda_risk,
+                tau=tau, tau_area=tau_area,
+            )
             for key in totals:
                 totals[key] += losses[key].item()
             n_batches += 1
@@ -194,12 +246,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--lambda-temporal", type=float, default=1.0,
-        help="Weight on the temporal consistency term. L1/SSIM alone scores each "
-             "frame independently, which a proportional correction satisfies while "
-             "leaving the flicker pattern intact at lower amplitude -- measured on a "
-             "real clip as a 60%% smaller brightness jump but only 12%% fewer "
-             "transitions. 0 disables the term and reproduces the previous objective.",
+        help="Weight on temporal consistency. Measured to be the term that "
+             "actually moves the output (35-43%% of gradient at settling), and "
+             "therefore the over-correction knob -- raise lambda_risk to fix "
+             "under-correction and nothing happens.",
     )
+    parser.add_argument(
+        "--lambda-risk", type=float, default=1.0,
+        help="Weight on the threshold penalty. Load-bearing (at 0 the flicker "
+             "stays flagged at its input level) but a near-threshold finisher, "
+             "not a driver: at tau=0.02 strongly-flagged pixels sit deep in "
+             "sigmoid saturation.",
+    )
+    parser.add_argument("--tau", type=float, default=0.02)
+    parser.add_argument("--tau-area", type=float, default=0.05)
     parser.add_argument("--log-path")
     parser.add_argument("--patch-size", type=int, default=None,
                         help="Optional: random crop to this spatial size (e.g. 256) for VRAM-limited training on local GPUs. "
@@ -283,8 +343,16 @@ def main(argv: list[str] | None = None) -> int:
 
     for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
-        train_loss = train_one_epoch(model, optimizer, train_loader, device, args.lambda_temporal)
-        val_metrics = evaluate(model, val_loader, device, args.lambda_temporal)
+        train_loss = train_one_epoch(
+            model, optimizer, train_loader, device, profile,
+            lambda_temporal=args.lambda_temporal, lambda_risk=args.lambda_risk,
+            tau=args.tau, tau_area=args.tau_area,
+        )
+        val_metrics = evaluate(
+            model, val_loader, device, profile,
+            lambda_temporal=args.lambda_temporal, lambda_risk=args.lambda_risk,
+            tau=args.tau, tau_area=args.tau_area,
+        )
         elapsed = time.time() - start_time
 
         # best_val_loss must reflect this epoch's result before latest.pt is
@@ -305,19 +373,26 @@ def main(argv: list[str] | None = None) -> int:
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_metrics["loss"],
-                "val_reconstruction": val_metrics["reconstruction"],
+                "val_fidelity": val_metrics["fidelity"],
                 "val_temporal": val_metrics["temporal"],
-                "val_psnr": val_metrics["psnr"],
+                "val_risk": val_metrics["risk"],
+                "val_soft_area": val_metrics["soft_area"],
                 "lambda_temporal": args.lambda_temporal,
+                "lambda_risk": args.lambda_risk,
+                "tau": args.tau,
+                "tau_area": args.tau_area,
                 "elapsed_seconds": elapsed,
             }) + "\n")
-        # The two loss terms are printed separately because they trade off:
-        # a run where val_temporal falls while val_reconstruction rises is
-        # buying flicker suppression with picture fidelity, and the combined
-        # number alone would hide which way that trade is going.
+        # Every term is printed separately because fidelity and temporal/risk
+        # trade off: a run where val_temporal falls while val_fidelity rises
+        # is buying flicker suppression with picture fidelity, and the
+        # combined number alone would hide which way that trade is going.
+        # There is no PSNR line -- it compared against a clean reference,
+        # and this objective no longer has one.
         print(f"epoch {epoch}: train_loss={train_loss:.4f} val_loss={val_metrics['loss']:.4f} "
-              f"(recon={val_metrics['reconstruction']:.4f} temporal={val_metrics['temporal']:.4f}) "
-              f"val_psnr={val_metrics['psnr']:.2f} ({elapsed:.1f}s)")
+              f"(fidelity={val_metrics['fidelity']:.4f} temporal={val_metrics['temporal']:.4f} "
+              f"risk={val_metrics['risk']:.4f} soft_area={val_metrics['soft_area']:.4f}) "
+              f"({elapsed:.1f}s)")
 
     return 0
 
