@@ -117,3 +117,25 @@ def test_contrast_stats_on_a_single_frame_is_its_own_nonzero_spread():
     result = contrast_stats([frame])
 
     assert result["mean_contrast"] > 0.0
+
+
+def test_a_static_clip_of_textured_frames_still_has_contrast():
+    # The discriminator the other two cannot be: a clip of several frames
+    # that are byte-identical to each other, each one internally textured.
+    #
+    # Nothing varies *between* these frames, so every temporal measure of
+    # them is 0 -- std of per-frame luminance, mean pairwise luminance
+    # delta, consecutive-frame delta, all of them, and none can escape via
+    # a single-frame fallback because there are six frames here. Spatial
+    # contrast is unmoved: each frame's own pixel spread is what it is,
+    # and repeating a frame does not flatten it.
+    #
+    # Without this, a temporal implementation that happens to be
+    # order-agnostic and to special-case n == 1 passes the whole file.
+    rng = np.random.default_rng(11)
+    frame = rng.random((32, 32, 3)).astype(np.float32)
+    static_clip = [frame.copy() for _ in range(6)]
+
+    result = contrast_stats(static_clip)
+
+    assert result["mean_contrast"] > 0.1
