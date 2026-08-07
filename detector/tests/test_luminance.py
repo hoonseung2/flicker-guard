@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from detector.luminance import relative_luminance
 
 def test_white_frame_has_luminance_one():
@@ -23,3 +24,29 @@ def test_pure_red_matches_bt709_red_coefficient():
     frame[..., 0] = 1.0  # pure red, R=1 G=0 B=0
     result = relative_luminance(frame)
     assert np.allclose(result, 0.2126, atol=1e-4)
+
+
+def test_srgb_to_linear_round_trips_through_linear_to_srgb():
+    from detector.luminance import linear_to_srgb, srgb_to_linear
+
+    values = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    assert np.allclose(linear_to_srgb(srgb_to_linear(values)), values, atol=1e-6)
+
+
+def test_linear_to_srgb_is_finite_for_negative_input():
+    # Compression clamps its output before converting back, but a fractional
+    # exponent on a negative base yields NaN, and a silent NaN frame is far
+    # worse than a clamped one -- the conversion must not be the thing that
+    # produces it.
+    from detector.luminance import linear_to_srgb
+
+    assert np.isfinite(linear_to_srgb(np.array([-0.5, 0.0, 0.5], dtype=np.float32))).all()
+
+
+def test_srgb_linear_boundary_values_are_exact():
+    from detector.luminance import linear_to_srgb, srgb_to_linear
+
+    assert srgb_to_linear(np.array([0.0], dtype=np.float32))[0] == pytest.approx(0.0)
+    assert srgb_to_linear(np.array([1.0], dtype=np.float32))[0] == pytest.approx(1.0)
+    assert linear_to_srgb(np.array([0.0], dtype=np.float32))[0] == pytest.approx(0.0)
+    assert linear_to_srgb(np.array([1.0], dtype=np.float32))[0] == pytest.approx(1.0)
