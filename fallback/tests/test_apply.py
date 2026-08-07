@@ -1,9 +1,17 @@
 import numpy as np
 import pytest
 
+from detector.luminance import srgb_to_linear
 from detector.pipeline import run_detection
 from detector.profiles import ThresholdProfile
-from fallback.apply import FallbackReport, fade_weights, mitigate_with_fallback
+from detector.segments import RiskSegment
+from fallback.apply import (
+    FallbackReport,
+    _apply_segments,
+    _segment_weights,
+    fade_weights,
+    mitigate_with_fallback,
+)
 
 PROFILE = ThresholdProfile(
     name="test", max_flashes_per_second=3, max_area_ratio=0.25,
@@ -85,9 +93,12 @@ def test_mitigate_with_fallback_clears_every_risk_segment():
     # 100% of pixels between them, driven by the reference values themselves,
     # not by any bug in the transfer function. This is an inherent limit of a
     # causal reference meeting a clip that starts mid-flash with no prior
-    # context, not something a real video ever does; a short safe lead-in
-    # avoids the unfixable corner case while still exercising the full
-    # verify/escalate loop against a genuine, sustained hazard.
+    # context. A real clip can begin that way (e.g. a hard cut straight into
+    # a strobe), and Tier 0 would hit the same ceiling there -- that is a
+    # real, if narrow, product limitation worth tracking separately, not
+    # something this unit test's fixture should be exercising. A short safe
+    # lead-in avoids the unfixable corner case while still exercising the
+    # full verify/escalate loop against a genuine, sustained hazard.
     frames = _flickering_clip(flicker_range=(10, 40))
     corrected, report = mitigate_with_fallback(frames, fps=20.0, profile=PROFILE)
 
@@ -158,3 +169,57 @@ def test_max_rounds_caps_the_escalation_loop():
     )
     assert isinstance(report, FallbackReport)
     assert report.rounds <= 1
+
+
+def test_final_strength_matches_the_strength_actually_applied():
+    # Regression guard: the escalation step at the bottom of the `for rounds`
+    # loop runs unconditionally, including on the last iteration, so it can
+    # bump `strengths[key]` *after* the last `_apply_segments` call that will
+    # ever use it. Reporting that bumped value as `final_strength` would
+    # claim a strength stronger than what actually built the returned
+    # frames. `test_max_rounds_caps_the_escalation_loop` uses
+    # strength_step=0.0, which makes the bump a no-op and cannot catch this
+    # -- this test uses a non-zero step and rebuilds the segment from the
+    # reported `final_strength` to check it reproduces the returned output.
+    frames = _flickering_clip(flicker_range=(10, 40))
+    corrected, report = mitigate_with_fallback(
+        frames, fps=20.0, profile=PROFILE, max_rounds=1, strength_step=0.1
+    )
+    assert len(report.segments) > 0
+
+    frames_linear = [srgb_to_linear(frame.astype(np.float32)) for frame in frames]
+    window_frames = 20  # round(fps) for fps=20.0
+    margin_frames = 10  # round(0.5 * fps) for fps=20.0
+
+    for outcome in report.segments:
+        key = (outcome.start_frame, outcome.end_frame)
+        segment = RiskSegment(start_frame=key[0], end_frame=key[1])
+        rebuilt = _apply_segments(
+            frames,
+            frames_linear,
+            [segment],
+            {key: outcome.final_strength},
+            window_frames,
+            margin_frames,
+        )
+        for index in range(key[0], key[1] + 1):
+            assert np.array_equal(rebuilt[index], corrected[index])
+
+
+def test_segment_weights_applies_independent_margins_per_side():
+    # A direct unit test for `_segment_weights`, which `_apply_segments`
+    # relies on to keep the fade from eating into frames that are still
+    # genuinely risky when a segment's padding was clipped by the clip's own
+    # boundary. `start_margin=0` means no safe buffer exists on that side
+    # (segment touches the clip's start) -- full strength should apply from
+    # offset 0. `end_margin=5` means a real 5-frame buffer exists on the
+    # other side, so that side should still ramp down smoothly.
+    weights = _segment_weights(length=20, start_margin=0, end_margin=5)
+    assert weights[0] == pytest.approx(1.0)
+    assert np.all(weights[:15] == pytest.approx(1.0))
+    assert weights[-1] < weights[-2] < weights[-3]
+    assert weights.min() >= 0.0 and weights.max() <= 1.0
+
+    # Symmetric margins should reproduce fade_weights exactly.
+    symmetric = _segment_weights(length=40, start_margin=10, end_margin=10)
+    assert np.array_equal(symmetric, fade_weights(length=40, margin_frames=10))

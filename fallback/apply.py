@@ -26,7 +26,7 @@ class SegmentOutcome:
     end_frame: int
     initial_strength: float
     final_strength: float
-    rounds: int
+    rounds: int  # escalations applied to THIS segment (0 if it passed on round 1)
     passed: bool
 
 
@@ -34,7 +34,7 @@ class SegmentOutcome:
 class FallbackReport:
     segments: list[SegmentOutcome]
     passed: bool
-    rounds: int
+    rounds: int  # total loop iterations run over the WHOLE clip (<= max_rounds)
     remaining_segments: int
 
 
@@ -162,6 +162,14 @@ def mitigate_with_fallback(
     frames_linear = [srgb_to_linear(frame.astype(np.float32)) for frame in frames]
 
     output = list(frames)
+    # Snapshot of the strengths that actually built `output`, as of the most
+    # recent `_apply_segments` call -- NOT the same object as `strengths`,
+    # which keeps getting escalated after that call, including on the final
+    # iteration when `max_rounds` is exhausted without convergence. Reporting
+    # `strengths` directly there would claim a strength that was bumped only
+    # after the last frame was ever rendered, never actually applied to the
+    # returned frames.
+    strengths_used = dict(strengths)
     remaining: list[RiskSegment] = []
     passed = False
     rounds = 0
@@ -170,6 +178,7 @@ def mitigate_with_fallback(
         output = _apply_segments(
             frames, frames_linear, segments, strengths, window_frames, margin_frames
         )
+        strengths_used = dict(strengths)
         _scores, remaining = run_detection(output, fps=fps, profile=profile)
         if not remaining:
             passed = True
@@ -196,7 +205,7 @@ def mitigate_with_fallback(
             start_frame=key[0],
             end_frame=key[1],
             initial_strength=initial[key],
-            final_strength=strengths[key],
+            final_strength=strengths_used[key],
             rounds=rounds_used[key],
             passed=not still_risky.intersection(range(key[0], key[1] + 1)),
         )
