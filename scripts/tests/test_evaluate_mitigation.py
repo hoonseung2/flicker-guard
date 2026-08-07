@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from scripts.evaluate_mitigation import contrast_stats
 
@@ -80,3 +81,39 @@ def test_contrast_stats_empty_list_returns_zero():
     result = contrast_stats([])
     assert result["mean_contrast"] == 0.0
     assert result["p95_contrast"] == 0.0
+
+
+def test_contrast_is_invariant_to_frame_reordering():
+    # "Contrast" here must mean within-frame spatial spread, not frame-to-
+    # frame temporal variation -- temporal variation IS the flicker, so
+    # measuring it would report the disease as the treatment's cost. Both
+    # of the tests above only check "some number goes down" -- they pass
+    # just as well against a wrong implementation that measures the
+    # temporal axis instead (confirmed by review: std of per-frame mean
+    # luminance passes both). This test targets the actual distinguishing
+    # property: within-frame spread is a pure function of one frame's own
+    # pixels, so it does not depend on where that frame sits in the clip.
+    # Reordering the clip must not change the reported contrast.
+    rng = np.random.default_rng(3)
+    frames = [rng.random((32, 32, 3)).astype(np.float32) for _ in range(6)]
+    reversed_frames = list(reversed(frames))
+    shuffled_frames = [frames[i] for i in (3, 0, 4, 1, 5, 2)]
+
+    original = contrast_stats(frames)
+    assert contrast_stats(reversed_frames)["mean_contrast"] == pytest.approx(original["mean_contrast"])
+    assert contrast_stats(shuffled_frames)["mean_contrast"] == pytest.approx(original["mean_contrast"])
+
+
+def test_contrast_stats_on_a_single_frame_is_its_own_nonzero_spread():
+    # A second discriminator against a temporal measure, independent of
+    # frame ordering: a temporal statistic computed across frames (e.g. std
+    # of per-frame mean luminance) has nothing to vary against with only
+    # one frame in the clip -- it degenerates to 0. Spatial contrast does
+    # not: a single non-flat frame still has a nonzero pixel spread within
+    # itself, because it never looks at any other frame to begin with.
+    rng = np.random.default_rng(4)
+    frame = rng.random((32, 32, 3)).astype(np.float32)
+
+    result = contrast_stats([frame])
+
+    assert result["mean_contrast"] > 0.0
