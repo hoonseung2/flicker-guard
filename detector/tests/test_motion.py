@@ -23,3 +23,50 @@ def test_compensate_shift_removes_pan_within_tolerance():
     interior = slice(16, 48)
     diff = np.abs(aligned[interior, interior] - prev[interior, interior])
     assert diff.mean() < 0.05
+
+
+def test_guard_does_not_fire_on_a_clean_translation():
+    # A textured image shifted by a known amount is exactly what phase
+    # correlation is for -- the guard must stay out of the way.
+    rng = np.random.default_rng(0)
+    base = rng.random((128, 128)).astype(np.float32)
+    shifted = np.roll(base, shift=5, axis=1)
+
+    dx, dy = estimate_global_shift(base, shifted)
+    assert abs(dx - 5.0) < 1.0
+    assert abs(dy) < 1.0
+
+
+def test_guard_rejects_a_shift_between_unrelated_noise_frames():
+    # Independent noise has no correspondence, so any shift phase
+    # correlation reports is fabricated. Returning zero means "no
+    # compensation", which is what the pipeline did before the motion stage
+    # existed and never compares unrelated pixels.
+    rng = np.random.default_rng(1)
+    a = rng.random((128, 128)).astype(np.float32)
+    b = rng.random((128, 128)).astype(np.float32)
+
+    assert estimate_global_shift(a, b) == (0.0, 0.0)
+
+
+def test_guard_rejects_a_shift_when_there_is_almost_no_structure():
+    # A nearly flat frame gives phase correlation nothing to lock onto, so
+    # whatever shift it reports comes from the noise floor. This is the same
+    # failure class found on real footage -- clip 57523 scores 0.0098 on
+    # every one of its 299 frame pairs, despite the mildest flicker in the
+    # set and no scene cuts.
+    rng = np.random.default_rng(3)
+    flat_a = np.full((128, 128), 0.5, dtype=np.float32) + rng.random((128, 128)).astype(np.float32) * 1e-4
+    flat_b = np.full((128, 128), 0.5, dtype=np.float32) + rng.random((128, 128)).astype(np.float32) * 1e-4
+
+    assert estimate_global_shift(flat_a, flat_b) == (0.0, 0.0)
+
+
+def test_min_response_zero_restores_the_unguarded_behaviour():
+    # Callers that want the raw estimate (e.g. a diagnostic that plots the
+    # distribution) must be able to opt out without reimplementing it.
+    rng = np.random.default_rng(2)
+    a = rng.random((128, 128)).astype(np.float32)
+    b = rng.random((128, 128)).astype(np.float32)
+
+    assert estimate_global_shift(a, b, min_response=0.0) != (0.0, 0.0)
