@@ -38,6 +38,12 @@ import numpy as np
 from detector.luminance import relative_luminance
 from detector.pipeline import run_detection_with_masks
 from detector.profiles import ThresholdProfile
+from detector.segments import RiskSegment
+# required_strength lives in fallback/ because it was written for the Tier 0
+# fallback path, but it computes a measurement (how far a segment's deltas
+# sit past the Detector's threshold), not a Tier 0 policy decision -- so
+# PriorCalc reuses it here rather than duplicating the quantile logic.
+from fallback.strength import required_strength
 from prior.histogram import compute_illumination_histogram
 
 # Canonical histogram bin count -- PriorCalc owns histogram computation, so
@@ -88,6 +94,38 @@ class FramePrior:
     # frame from training -- rather than as an exceptional/failed computation.
     target_histogram: np.ndarray | None
     mask: np.ndarray
+    # How far this frame's risk segment has to be pushed, as a fraction of
+    # its per-pixel luminance deltas -- 0.0 outside any segment.
+    #
+    # The model sees a three-frame window and cannot tell from it how severe
+    # the surrounding segment is. The old conditioning was a histogram of
+    # "what normal illumination looks like", which describes a destination
+    # but not a distance; the trained model reached a median 14.6% of it.
+    # This is the distance, derived from the same quantity the Detector
+    # thresholds on. Apple's published mitigation scales its strength the
+    # same way, from a measured risk score rather than a fixed constant.
+    required_strength: float = 0.0
+
+
+def _assign_segment_strengths(
+    frames: list[np.ndarray],
+    priors: list[FramePrior],
+    segments: list[RiskSegment],
+    profile: ThresholdProfile,
+) -> None:
+    """Give every frame of a risk segment that segment's required strength.
+
+    The strength is a per-segment quantity by construction --
+    `fallback.strength.required_strength` takes the maximum over the
+    segment's frame pairs, because a segment is flagged if any pair in it
+    trips the area limit. Handing different frames of one segment different
+    values would be incoherent, so they all get the segment's value.
+    """
+    for segment in segments:
+        window = frames[segment.start_frame : segment.end_frame + 1]
+        strength = required_strength(window, profile)
+        for index in range(segment.start_frame, segment.end_frame + 1):
+            priors[index].required_strength = strength
 
 
 def compute_prior(
@@ -103,7 +141,7 @@ def compute_prior(
     # returns a generator -- would be drained by run_detection_with_masks and
     # the later zip would then silently yield an empty result.
     frames = list(frames)
-    scores, _segments, masks = run_detection_with_masks(frames, fps=fps, profile=profile)
+    scores, segments, masks = run_detection_with_masks(frames, fps=fps, profile=profile)
 
     # Same trailing-window length the old temporal smoother used -- one
     # second's worth of frames is long enough to damp frame-to-frame
@@ -129,4 +167,5 @@ def compute_prior(
                 window.pop(0)
             last_valid_target = np.mean(window, axis=0)
         results.append(FramePrior(frame_index=score.frame_index, target_histogram=last_valid_target, mask=mask))
+    _assign_segment_strengths(frames, results, segments, profile)
     return results

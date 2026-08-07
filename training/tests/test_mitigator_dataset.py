@@ -273,3 +273,32 @@ def test_partner_falls_back_to_the_frame_itself_at_a_segment_end(tmp_path):
     example = dataset[pos]
     assert torch.equal(example["window"], example["window_partner"])
     assert torch.equal(example["clean"], example["clean_partner"])
+
+
+def test_getitem_carries_the_required_strength(tmp_path):
+    _write_fake_sample(tmp_path, "clipS", n_frames=20, h=8, w=8, fps=10.0,
+                       segments=[{"start_frame": 12, "end_frame": 15}])
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=clip_split("clipS"))
+    example = dataset[0]
+    assert example["strength"].shape == (1,)
+    assert 0.0 <= float(example["strength"]) <= 1.0
+    assert example["strength_partner"].shape == (1,)
+
+
+def test_a_stale_prior_cache_is_rejected_rather_than_misread(tmp_path):
+    # The cache stores derived arrays with no self-description. A cache
+    # written before required_strength existed would otherwise load with a
+    # missing field and fail somewhere far from the cause.
+    import numpy as np
+    from training.mitigator_dataset import _load_prior_cache
+
+    stale = tmp_path / "prior_cache.npz"
+    np.savez_compressed(
+        stale,
+        has_target=np.array([True]),
+        histograms=np.zeros((1, 64), dtype=np.float32),
+        masks=np.ones((1, 4, 4), dtype=bool),
+        frame_indices=np.array([0], dtype=np.int64),
+    )
+    with pytest.raises(ValueError, match="prior cache"):
+        _load_prior_cache(stale)

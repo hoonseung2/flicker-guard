@@ -176,3 +176,63 @@ def test_compute_prior_persistence_window_scales_with_fps():
     # 0.5s is 5 frames at 10fps but 15 at 30fps -- the wider window can only
     # flag more, never less.
     assert sum(p.mask.sum() for p in fast) > sum(p.mask.sum() for p in slow)
+
+
+def test_frame_prior_carries_the_segments_required_strength():
+    # The model sees a three-frame window; how hard this segment needs to be
+    # pushed is global context it cannot derive locally. Measured: the
+    # previous model reached a median 14.6% of its own target, and a
+    # histogram describing "what normal looks like" never told it how far to
+    # move.
+    import numpy as np
+    from prior.compute import compute_prior
+
+    rng = np.random.default_rng(0)
+    base = rng.random((24, 24, 3)).astype(np.float32) * 0.2
+    frames = []
+    for i in range(40):
+        frame = base.copy()
+        if 15 <= i < 30 and i % 2 == 0:
+            frame[:, :16] = 0.95
+        frames.append(frame)
+
+    priors = compute_prior(frames, fps=20.0, profile=PROFILE)
+
+    flagged = [p for p in priors if p.required_strength > 0.0]
+    assert flagged, "the flickering stretch should carry a nonzero strength"
+    assert all(0.0 <= p.required_strength <= 1.0 for p in priors)
+
+
+def test_frames_outside_a_risk_segment_have_zero_strength():
+    # A frame the Detector did not flag needs no correction, and a nonzero
+    # strength there would tell the model to move a frame that is already
+    # compliant.
+    import numpy as np
+    from prior.compute import compute_prior
+
+    rng = np.random.default_rng(1)
+    frames = [rng.random((24, 24, 3)).astype(np.float32) * 0.1 for _ in range(30)]
+
+    priors = compute_prior(frames, fps=20.0, profile=PROFILE)
+    assert all(p.required_strength == 0.0 for p in priors)
+
+
+def test_every_frame_in_one_segment_shares_that_segments_strength():
+    # required_strength is a per-segment quantity: it is the max over the
+    # segment's frame pairs, so handing different frames of one segment
+    # different values would be incoherent.
+    import numpy as np
+    from prior.compute import compute_prior
+
+    rng = np.random.default_rng(2)
+    base = rng.random((24, 24, 3)).astype(np.float32) * 0.2
+    frames = []
+    for i in range(40):
+        frame = base.copy()
+        if 15 <= i < 30 and i % 2 == 0:
+            frame[:, :16] = 0.95
+        frames.append(frame)
+
+    priors = compute_prior(frames, fps=20.0, profile=PROFILE)
+    values = {round(p.required_strength, 6) for p in priors if p.required_strength > 0.0}
+    assert len(values) == 1, f"expected one strength across the segment, got {values}"

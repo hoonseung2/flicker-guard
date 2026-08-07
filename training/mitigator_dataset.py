@@ -30,6 +30,12 @@ from prior.compute import DEFAULT_N_BINS, FramePrior, compute_prior
 
 _TRAIN_PCT = 80
 
+# Bumped whenever prior_cache.npz's contents change meaning. A cache
+# written by an older version is rejected rather than loaded with missing
+# or misinterpreted fields -- the failure would otherwise surface as bad
+# training rather than an error.
+_PRIOR_CACHE_VERSION = 2
+
 
 def clip_split(clip_id: str) -> str:
     return "train" if zlib.crc32(clip_id.encode("utf-8")) % 100 < _TRAIN_PCT else "val"
@@ -64,15 +70,33 @@ def _save_prior_cache(cache_path: Path, priors: list[FramePrior]) -> None:
         histograms=histograms,
         masks=masks,
         frame_indices=frame_indices,
+        version=np.array([_PRIOR_CACHE_VERSION], dtype=np.int64),
+        required_strengths=np.array([p.required_strength for p in priors], dtype=np.float32),
     )
 
 
 def _load_prior_cache(cache_path: Path) -> list[FramePrior]:
     with np.load(cache_path) as data:
+        # try/except rather than `"version" in data`: NpzFile supports `in`,
+        # but this also has to work against the CountingNpzFile stub in
+        # test_load_prior_cache_reads_each_key_only_once, which only
+        # implements __getitem__ -- `in` on that falls back to the legacy
+        # int-indexed iteration protocol and raises, not KeyError.
+        try:
+            version = int(data["version"][0])
+        except KeyError:
+            version = 1
+        if version != _PRIOR_CACHE_VERSION:
+            raise ValueError(
+                f"prior cache {cache_path} is version {version}, expected "
+                f"{_PRIOR_CACHE_VERSION}. Delete every data/synthetic/*/prior_cache.npz "
+                f"and let training regenerate them."
+            )
         frame_indices = data["frame_indices"]
         histograms = data["histograms"]
         has_target = data["has_target"]
         masks = data["masks"]
+        strengths = data["required_strengths"]
     priors = []
     for i in range(len(frame_indices)):
         target = histograms[i] if has_target[i] else None
@@ -80,6 +104,7 @@ def _load_prior_cache(cache_path: Path) -> list[FramePrior]:
             frame_index=int(frame_indices[i]),
             target_histogram=target,
             mask=masks[i],
+            required_strength=float(strengths[i]),
         ))
     return priors
 
@@ -185,6 +210,7 @@ class MitigatorDataset(Dataset):
             "mask": torch.from_numpy(prior.mask[None, :, :].astype(np.float32)),
             "histogram": torch.from_numpy(prior.target_histogram).float(),
             "clean": torch.from_numpy(clean_center.transpose(2, 0, 1)).float(),
+            "strength": torch.tensor([prior.required_strength], dtype=torch.float32),
         }
 
     def __getitem__(self, idx: int) -> dict:
@@ -212,4 +238,5 @@ class MitigatorDataset(Dataset):
         example["mask_partner"] = partner["mask"]
         example["histogram_partner"] = partner["histogram"]
         example["clean_partner"] = partner["clean"]
+        example["strength_partner"] = partner["strength"]
         return example
