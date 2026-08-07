@@ -544,3 +544,23 @@ def test_temporal_term_charges_for_flicker_the_clean_pair_does_not_have():
     losses = compute_losses(batch, model, device="cpu", lambda_temporal=1.0)
     assert losses["temporal"].item() > 0.0
     assert losses["loss"].item() > losses["reconstruction"].item()
+
+
+def test_patch_collate_fn_is_picklable():
+    # Windows (and any spawn-based start method) pickles collate_fn to send
+    # it to each DataLoader worker. A closure cannot be pickled, so a
+    # closure-based collate raised "Can't get local object" at the first
+    # batch -- invisible on Linux, which forks instead.
+    import pickle
+
+    from training.train_mitigator import _make_patch_collate_fn
+
+    collate = _make_patch_collate_fn(8)
+    restored = pickle.loads(pickle.dumps(collate))
+    item = {
+        "window": torch.rand(9, 16, 16), "mask": torch.ones(1, 16, 16),
+        "clean": torch.rand(3, 16, 16), "histogram": torch.zeros(64),
+        "window_partner": torch.rand(9, 16, 16), "mask_partner": torch.ones(1, 16, 16),
+        "clean_partner": torch.rand(3, 16, 16), "histogram_partner": torch.zeros(64),
+    }
+    assert restored([item])["window"].shape == (1, 9, 8, 8)

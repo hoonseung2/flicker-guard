@@ -116,17 +116,27 @@ def evaluate(model: MitigatorNet, dataloader: DataLoader, device: str, lambda_te
     return {key: value / n_batches for key, value in totals.items()}
 
 
-def _make_patch_collate_fn(patch_size: int):
-    """Creates a collate function that randomly crops all spatial tensors to patch_size.
+class _PatchCollate:
+    """Collates a batch, randomly cropping every spatial tensor to patch_size.
 
     Window, mask, and clean are cropped with the same random offset to preserve their
     spatial alignment in the training pair (misaligned crops would produce invalid labels).
     Histogram (non-spatial vector) is left untouched. Crop size clamps to actual H/W if smaller.
-    """
-    if patch_size <= 0:
-        raise ValueError(f"patch_size must be positive, got {patch_size}")
 
-    def collate_fn(batch_list):
+    A class rather than a closure because DataLoader workers started with
+    the `spawn` method -- the only option on Windows -- pickle collate_fn to
+    send it to each worker, and a closure is not picklable ("Can't get local
+    object"). Linux forks instead, so a closure survives there and this
+    failure is invisible until the code runs on Windows.
+    """
+
+    def __init__(self, patch_size: int):
+        if patch_size <= 0:
+            raise ValueError(f"patch_size must be positive, got {patch_size}")
+        self.patch_size = patch_size
+
+    def __call__(self, batch_list):
+        patch_size = self.patch_size
         # Crop BEFORE stacking. Source clips don't all share one resolution --
         # preserving aspect ratio when preparing them yields e.g. 854x480
         # alongside 854x450 -- and default_collate stacks first, so calling it
@@ -162,7 +172,9 @@ def _make_patch_collate_fn(patch_size: int):
 
         return default_collate(cropped)
 
-    return collate_fn
+
+def _make_patch_collate_fn(patch_size: int) -> _PatchCollate:
+    return _PatchCollate(patch_size)
 
 
 def main(argv: list[str] | None = None) -> int:
