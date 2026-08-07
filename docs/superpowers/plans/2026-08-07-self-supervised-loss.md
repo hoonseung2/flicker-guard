@@ -63,16 +63,17 @@ def test_guard_rejects_a_shift_between_unrelated_noise_frames():
     assert estimate_global_shift(a, b) == (0.0, 0.0)
 
 
-def test_guard_rejects_a_shift_on_a_repeating_pattern():
-    # A periodic pattern fits equally well one period over, so the
-    # correlation peak splits and the reported shift is arbitrary. This is
-    # the failure mode found on real footage (clip 57523: 299 of 299 frame
-    # pairs unusable, despite the mildest flicker in the set and no cuts).
-    x = np.arange(128, dtype=np.float32)
-    stripes = np.tile(np.sin(x * np.pi / 4)[None, :], (128, 1)).astype(np.float32)
-    shifted = np.roll(stripes, shift=17, axis=1)
+def test_guard_rejects_a_shift_when_there_is_almost_no_structure():
+    # A nearly flat frame gives phase correlation nothing to lock onto, so
+    # whatever shift it reports comes from the noise floor. This is the same
+    # failure class found on real footage -- clip 57523 scores 0.0098 on
+    # every one of its 299 frame pairs, despite the mildest flicker in the
+    # set and no scene cuts.
+    rng = np.random.default_rng(3)
+    flat_a = np.full((128, 128), 0.5, dtype=np.float32) + rng.random((128, 128)).astype(np.float32) * 1e-4
+    flat_b = np.full((128, 128), 0.5, dtype=np.float32) + rng.random((128, 128)).astype(np.float32) * 1e-4
 
-    assert estimate_global_shift(stripes, shifted) == (0.0, 0.0)
+    assert estimate_global_shift(flat_a, flat_b) == (0.0, 0.0)
 
 
 def test_min_response_zero_restores_the_unguarded_behaviour():
@@ -251,20 +252,28 @@ def test_gradients_flow_to_both_frames():
 
 
 def test_valid_mask_excludes_pixels_from_the_average():
-    # The temporal term warps one frame, and BORDER_REPLICATE fills the
-    # edge with copies that are not real correspondences. Those pixels must
-    # not count toward the area, or a wide warp dilutes it toward zero and
-    # the model is under-charged for exceeding the limit.
+    # The temporal term warps one frame, and the vacated edge holds pixels
+    # that have no real correspondence. Those must not count toward the
+    # area, or a wide warp dilutes it and the model is under-charged for
+    # exceeding the limit.
+    #
+    # The flagged region and the excluded region are deliberately the SAME
+    # half: excluding it must drive the area to roughly zero. A test where
+    # they are uncorrelated would pass just as well if valid_mask were
+    # ignored entirely.
     rng = np.random.default_rng(4)
     base = rng.random((32, 32, 3)).astype(np.float32) * 0.2
-    bright = np.clip(base + 0.7, 0.0, 1.0)
+    bright = base.copy()
+    bright[:, :16] = np.clip(bright[:, :16] + 0.7, 0.0, 1.0)   # flag the left half
 
     valid = torch.ones(1, 1, 32, 32)
-    valid[:, :, :, :16] = 0.0   # discard the left half
+    valid[:, :, :, :16] = 0.0                                   # exclude the left half
 
     full = soft_flagged_area(_to_torch(base), _to_torch(bright), PROFILE).item()
-    half = soft_flagged_area(_to_torch(base), _to_torch(bright), PROFILE, valid_mask=valid).item()
-    assert full == pytest.approx(half, abs=0.05)   # uniformly flagged -> same ratio
+    excluded = soft_flagged_area(_to_torch(base), _to_torch(bright), PROFILE, valid_mask=valid).item()
+
+    assert full > 0.4          # about half the frame is genuinely flagged
+    assert excluded < 0.05     # and none of it survives the mask
 
 
 def test_penalty_is_negligible_below_the_limit_and_grows_above():
