@@ -18,6 +18,43 @@ import numpy as np
 _MIN_PHASE_CORRELATION_RESPONSE = 0.30
 
 
+def estimate_global_shift_checked(
+    prev_gray: np.ndarray,
+    curr_gray: np.ndarray,
+    min_response: float = _MIN_PHASE_CORRELATION_RESPONSE,
+) -> tuple[float, float, bool]:
+    """Estimate global shift and report, from the same correlation call,
+    whether that estimate should be trusted.
+
+    This is the one place the confidence guard is decided. `estimate_global_shift`
+    delegates to it so a caller that only wants the (possibly zeroed) shift and
+    a caller that also needs to know *why* it might be zero -- e.g. to avoid
+    charging a rejected pan as flicker -- can never compute the guard
+    differently: comparing the response against `min_response` in two places
+    would let them drift out of sync if `min_response`'s default ever changed
+    in one but not the other.
+
+    Args:
+        prev_gray: Previous frame as (H, W) float32 grayscale array.
+        curr_gray: Current frame as (H, W) float32 grayscale array.
+        min_response: Reject the estimate below this peak height. A
+            non-positive value (e.g. 0.0) disables the guard entirely and
+            treats the estimate as trusted regardless of response, including
+            when the response itself is negative.
+
+    Returns:
+        Tuple of (dx, dy, trusted): the raw phase-correlation estimate and
+        whether it cleared `min_response`. `dx, dy` are the raw estimate even
+        when `trusted` is False -- callers that want the guarded (zeroed)
+        shift should use `estimate_global_shift`.
+    """
+    (dx, dy), response = cv2.phaseCorrelate(
+        prev_gray.astype(np.float32), curr_gray.astype(np.float32)
+    )
+    trusted = not (min_response > 0.0 and response < min_response)
+    return dx, dy, trusted
+
+
 def estimate_global_shift(
     prev_gray: np.ndarray,
     curr_gray: np.ndarray,
@@ -40,10 +77,8 @@ def estimate_global_shift(
     Returns:
         Tuple of (dx, dy) representing pixel shift in x and y directions.
     """
-    (dx, dy), response = cv2.phaseCorrelate(
-        prev_gray.astype(np.float32), curr_gray.astype(np.float32)
-    )
-    if min_response > 0.0 and response < min_response:
+    dx, dy, trusted = estimate_global_shift_checked(prev_gray, curr_gray, min_response)
+    if not trusted:
         return 0.0, 0.0
     return dx, dy
 

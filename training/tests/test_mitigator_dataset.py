@@ -32,6 +32,33 @@ def _write_fake_sample(root, clip_id, n_frames=20, h=8, w=8, fps=10.0, segments=
     return sample_dir
 
 
+def _write_textured_sample(root, clip_id, n_frames=20, h=16, w=16, fps=10.0, segments=None, seed=0):
+    # _write_fake_sample's flat frames give phase correlation nothing to
+    # lock onto (response ~0.002), so shift_trusted is always False there --
+    # never exercising the trusted branch through real computation. Every
+    # frame here is the *same* seeded-noise texture repeated across the
+    # clip (no injected motion), so consecutive frames correlate against
+    # themselves and score a strong response, while still being pixel-
+    # identical from frame to frame like _write_fake_sample's flat frames --
+    # same "no risk-detector side effects" property, just with structure.
+    sample_dir = root / f"{clip_id}__test__general__000"
+    rng = np.random.default_rng(seed)
+    texture = rng.random((h, w, 3)).astype(np.float32)
+    frames = [texture.copy() for _ in range(n_frames)]
+    _write_frames(frames, sample_dir / "clean")
+    _write_frames(frames, sample_dir / "degraded")
+    meta = {
+        "clip_id": clip_id,
+        "fps": fps,
+        "profile": "test",
+        "pattern": "general",
+        "injection_mode": "flat",
+        "segments": segments if segments is not None else [],
+    }
+    (sample_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return sample_dir
+
+
 def test_clip_split_is_deterministic():
     assert clip_split("bear") == clip_split("bear")
 
@@ -306,6 +333,9 @@ def test_a_self_paired_frame_reports_no_shift(tmp_path):
     example = dataset[frame_indices.index(max(frame_indices))]
     assert float(example["shift"][0]) == 0.0
     assert float(example["shift"][1]) == 0.0
+    # Trusted precisely because it is not a guess -- there is nothing to
+    # reject when there is no phase correlation call at all.
+    assert float(example["shift_trusted"]) == 1.0
 
 
 def test_an_untrusted_shift_is_flagged_rather_than_silently_zeroed(tmp_path, monkeypatch):
@@ -316,13 +346,33 @@ def test_an_untrusted_shift_is_flagged_rather_than_silently_zeroed(tmp_path, mon
     # absorb it. Measured: 33.6% of pairs rejected on one real clip.
     import training.mitigator_dataset as dataset_module
 
-    monkeypatch.setattr(dataset_module, "estimate_global_shift", lambda a, b: (0.0, 0.0))
-    monkeypatch.setattr(dataset_module, "_shift_is_trusted", lambda a, b: False)
+    monkeypatch.setattr(
+        dataset_module, "estimate_global_shift_checked", lambda a, b: (0.0, 0.0, False)
+    )
 
     _write_fake_sample(tmp_path, "clipU", n_frames=20, h=16, w=16, fps=10.0,
                        segments=[{"start_frame": 12, "end_frame": 15}])
     dataset = MitigatorDataset(tmp_path, PROFILE, split=clip_split("clipU"))
     assert float(dataset[0]["shift_trusted"]) == 0.0
+
+
+def test_a_textured_pair_is_trusted_by_real_phase_correlation(tmp_path):
+    # _write_fake_sample's flat frames score too low (~0.002) to ever reach
+    # shift_trusted == 1.0 through real computation -- every existing test
+    # touching "shift_trusted" either hits the self-paired shortcut or a
+    # monkeypatch. This drives an actual textured pair through
+    # estimate_global_shift_checked so the trusted branch is exercised for
+    # real: identical frames with real structure correlate with a strong
+    # peak (response near 1.0), well above the 0.30 guard.
+    _write_textured_sample(tmp_path, "clipW", n_frames=20, h=16, w=16, fps=10.0,
+                           segments=[{"start_frame": 12, "end_frame": 15}])
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=clip_split("clipW"))
+    frame_indices = [idx for _, idx in dataset._index]
+    # Use the segment's first indexed frame so the partner is a real
+    # neighbour, not the self-paired shortcut at the segment's last frame.
+    pos = frame_indices.index(min(frame_indices))
+    example = dataset[pos]
+    assert float(example["shift_trusted"]) == 1.0
 
 
 def test_a_stale_prior_cache_is_rejected_rather_than_misread(tmp_path):
