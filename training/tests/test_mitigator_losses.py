@@ -306,8 +306,76 @@ def test_per_item_shift_is_forwarded_correctly_in_a_batch():
     assert shared_wrong["temporal"].item() > correct["temporal"].item() + 0.05
 
 
+def test_fidelity_and_temporal_average_per_item_not_pooled_across_the_batch():
+    # fidelity and temporal must use the SAME reduction convention as risk
+    # and soft_area: average per batch item, then average across items.
+    #
+    # Item 0 has no shift (fully valid) and a large residual flicker the
+    # model introduced (out_b0 jumps far from in_b0, with nothing in the
+    # input pair to justify it). Item 1 has a real, large (20px) shift that
+    # warp_by_shift compensates for exactly, so its temporal delta is ~0,
+    # but the shift also zero-fills and invalidates a wide border strip,
+    # leaving it with well under item 0's valid-pixel count (1344 vs. 2304
+    # of 2304 pixels, measured below) -- large enough that pooled vs.
+    # per-item averaging give visibly different numbers, not a difference
+    # lost in floating-point noise.
+    #
+    # Pooling raw elements across the batch would blend item 0's large
+    # per-pixel delta over BOTH items' valid pixels (item 0's plus item 1's
+    # smaller valid count), diluting it. Averaging per item first weights
+    # item 0's average equally with item 1's zero, regardless of how many
+    # valid pixels either contributed. The two conventions give visibly
+    # different numbers here, which is what this test pins down.
+    import torch.nn.functional as F
+
+    from training.mitigator_losses import relative_luminance_torch, self_supervised_loss, warp_by_shift
+
+    g = torch.Generator().manual_seed(21)
+    base0 = torch.rand(1, 3, 48, 48, generator=g) * 0.3 + 0.2
+    a0, b0 = base0.clone(), base0.clone()
+    out_a0 = a0.clone()
+    out_b0 = (b0 + 0.4).clamp(0, 1)  # residual flicker with no basis in the input pair
+
+    base1 = torch.rand(1, 3, 48, 48, generator=g) * 0.3 + 0.2
+    a1 = base1.clone()
+    b1 = torch.roll(base1, shifts=20, dims=3)  # real motion, correctly compensated below
+    out_a1, out_b1 = a1.clone(), b1.clone()
+
+    in_a = torch.cat([a0, a1], dim=0)
+    in_b = torch.cat([b0, b1], dim=0)
+    out_a = torch.cat([out_a0, out_a1], dim=0)
+    out_b = torch.cat([out_b0, out_b1], dim=0)
+    dx = torch.tensor([0.0, 20.0])
+    dy = torch.zeros(2)
+
+    terms = self_supervised_loss(out_a, out_b, in_a, in_b, dx, dy, _profile())
+
+    fid_per_item = (
+        F.l1_loss(out_a, in_a, reduction="none").mean(dim=(1, 2, 3))
+        + F.l1_loss(out_b, in_b, reduction="none").mean(dim=(1, 2, 3))
+    )
+    expected_fidelity = fid_per_item.mean()
+    assert terms["fidelity"].item() == pytest.approx(expected_fidelity.item(), abs=1e-6)
+
+    warped, valid = warp_by_shift(out_a, dx, dy)
+    delta = (relative_luminance_torch(warped) - relative_luminance_torch(out_b)).abs()
+    per_item_denom = valid.sum(dim=(1, 2, 3)).clamp(min=1e-6)
+    expected_temporal = ((delta * valid).sum(dim=(1, 2, 3)) / per_item_denom).mean()
+    assert terms["temporal"].item() == pytest.approx(expected_temporal.item(), abs=1e-6)
+
+    # Confirm the per-item value actually differs -- materially, not just
+    # past floating-point noise -- from the pooled-across-the-batch value,
+    # so this test would fail (not vacuously pass) if a future change
+    # switched the convention back. (Measured: per-item ~0.213, pooled
+    # ~0.269 -- a >20% relative gap driven by item 1's smaller valid-pixel
+    # count, 1344 vs. item 0's 2304.)
+    pooled_denom = valid.sum().clamp(min=1e-6)
+    pooled_temporal = ((delta * valid).sum() / pooled_denom).item()
+    assert abs(terms["temporal"].item() - pooled_temporal) > 0.03
+
+
 def test_flattening_with_a_tight_area_limit_still_charges_risk():
-    # With max_area_ratio relaxed to near zero, even the flattened pair
+    # With max_area_ratio tightened to near zero, even the flattened pair
     # (which clears a normal limit almost entirely -- see
     # test_flattening_the_pair_clears_the_risk_term_but_costs_fidelity)
     # exceeds it, so softplus's small-excess branch should still produce a

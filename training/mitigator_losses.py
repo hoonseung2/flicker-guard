@@ -170,15 +170,34 @@ def self_supervised_loss(
 ) -> dict[str, torch.Tensor]:
     """Loss for two consecutive frames, with no clean reference.
 
-    Three terms pull against each other:
+    Three terms pull against each other, but not as evenly as that suggests.
+    A 400-step Adam optimisation run directly against this loss (see
+    `docs/superpowers/specs/2026-08-07-soft-risk-agreement.md`'s companion
+    measurement) found:
 
-    - fidelity keeps the output on its input, so doing nothing is the
-      default and every change has to be paid for;
-    - temporal drives consecutive outputs together after cancelling camera
-      motion, which is what actually removes flicker;
-    - risk charges only for exceeding the Detector's own area limit, so the
-      correction stops as soon as the clip is compliant instead of
-      flattening everything a global weight happens to reach.
+    - temporal is what actually *moves* the output -- at settling it holds
+      35-43% of the gradient magnitude on `out_a`, against 54-63% for
+      fidelity and only 1.7-2.3% for risk;
+    - risk is a near-threshold finisher, not a driver. At `tau = 0.02`,
+      pixels already flagged sit deep in the relaxing sigmoid's saturated
+      region, where its gradient is ~0; isolating risk (`lambda_temporal=0,
+      lambda_risk=100`) moved a fully-flagged case's flagged area by
+      0.0000. `max_area_ratio` is not an attractor the output settles at --
+      a global-flash case measured settling at soft area 0.107 (hard 0.000)
+      against a limit of 0.25, well clear of it, and an already-compliant
+      input (hard 0.0938) still got pushed further, to 0.0811. The
+      equilibrium is set by fidelity vs. temporal, not by the limit;
+    - risk is nonetheless load-bearing: with `lambda_risk=0`, both
+      flickering test cases stayed at their input's flagged area (amplitude
+      reduced, but still flagged) -- exactly the "corrects every frame by
+      the same proportion, flicker intact" failure this design exists to
+      remove. Without risk, nothing in the loss favours crossing the
+      threshold over merely approaching it.
+
+    Practically: **`lambda_temporal`, not `lambda_risk`, is the
+    over-correction knob.** Turning `lambda_risk` up sharpens the finish
+    near the limit; turning `lambda_temporal` up is what flattens more of
+    the frame.
 
     The risk term is why this exists. Grading a frame against a clean
     reference, as the previous objective did, cannot see flicker at all --
@@ -195,14 +214,23 @@ def self_supervised_loss(
     # circular.
     from training.soft_risk import risk_penalty, soft_flagged_area
 
-    fidelity = F.l1_loss(out_a, in_a) + F.l1_loss(out_b, in_b)
+    # All four terms use the SAME reduction convention: average per batch
+    # item first, then average across items. That matters once items in a
+    # batch have unequal valid-pixel counts (e.g. one item's warp clips more
+    # border than another's) -- pooling raw elements across the batch before
+    # averaging would silently down-weight the item with fewer valid pixels
+    # instead of counting every item equally.
+    fidelity = (
+        F.l1_loss(out_a, in_a, reduction="none").mean(dim=(1, 2, 3))
+        + F.l1_loss(out_b, in_b, reduction="none").mean(dim=(1, 2, 3))
+    ).mean()
 
     warped_out_a, valid = warp_by_shift(out_a, dx, dy)
     luminance_delta = (
         relative_luminance_torch(warped_out_a) - relative_luminance_torch(out_b)
     ).abs()
-    denominator = valid.sum().clamp(min=1e-6)
-    temporal = (luminance_delta * valid).sum() / denominator
+    per_item_denominator = valid.sum(dim=(1, 2, 3)).clamp(min=1e-6)
+    temporal = ((luminance_delta * valid).sum(dim=(1, 2, 3)) / per_item_denominator).mean()
 
     area = soft_flagged_area(warped_out_a, out_b, profile, tau=tau, valid_mask=valid)
     risk = risk_penalty(area, profile.max_area_ratio, tau_area=tau_area).mean()
