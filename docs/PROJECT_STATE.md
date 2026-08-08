@@ -1,4 +1,4 @@
-# Project state — 2026-08-08
+# Project state — 2026-08-09
 
 Written so a fresh Claude Code session on another machine can pick up where
 this one left off. Claude Code's memory lives outside the repo and is keyed
@@ -20,9 +20,103 @@ criterion.
 Also on `master`: the **Tier 0 fallback**, the project's first output to
 pass Detector re-validation (3/3 real clips).
 
-Phase 1 training is **finished**. It answered the question it was built to
-answer, and the answer is not the one the rest of this file was written
-expecting — read the next section before planning anything.
+Phase 1 and **phase 2 are both finished**. Training on real footage works —
+2 of the 6 evaluation clips now pass, against 0 before, and one of them
+beats the Tier 0 fallback on cost as well as on risk. The other four do not.
+Read the next two sections before planning anything.
+
+---
+
+## Phase 2 result — 2 of 6, and where the other 4 fail
+
+Trained on 14 real clips (8,190 frames, ingested at 512). Two runs, same
+settings, differing only in initialisation. Both reach 30 epochs in under
+an hour: **110 s per epoch**, 5,865 train examples.
+
+**`--init-from` won**, by the criterion the design spec set: total remaining
+risk segments first, total triggering frames as the tiebreak.
+
+| | from scratch | `--init-from` phase 1 |
+|---|---|---|
+| best epoch | 28 | **16** |
+| `val_loss` | 0.2674 | **0.2538** |
+| `soft_area` | 0.0489 | **0.0452** |
+| triggering frames, 3 Tier-0 clips | 213 | **157** |
+
+### The clips with a Tier 0 baseline — 2 of 3
+
+| clip | Tier 0 | phase 1 best | **phase 2** |
+|---|---|---|---|
+| wonbon | 5 → 0 | 5 → 2 | **5 → 0** |
+| Anyma | 1 → 0 | 1 → 0 | **1 → 0** |
+| Cera Khin | 1 → 0 | 1 → 1 | 1 → 1 |
+
+**wonbon is the first output in this project to clear both halves of spec
+§7 at once** — zero remaining segments *and* a smaller in-segment contrast
+cost than Tier 0 (−48.6% against −52.8%). All 574 of its triggering frames
+are gone and peak windowed area fell 64.5%.
+
+Anyma passes on risk and loses on cost: −29.9% against Anyma's own Tier 0
+figure of **−6.0%**. (Not −52.8% — see the misattribution note under
+Known-deferred items. Read against the wrong baseline this looks like a win.)
+
+### The untouched holdout — 0 of 3
+
+These three were never read until the final evaluation. They are harder,
+and the spec chose them precisely to be:
+
+| clip | segments | triggering frames | peak area |
+|---|---|---|---|
+| `1257-144566582_medium` | 4 → **6** | 867 → 580 (−33%) | +0.3% |
+| `16046-269122203_medium` | 1 → 1 | 71 → 27 (−62%) | **+16.0%** |
+| `videoplayback` | 1 → 1 | 158 → **158** | 1.000 → 1.000 |
+
+Three distinct failures, not one:
+
+- **`1257` got worse by the bar that counts.** Triggering frames fell a
+  third, but the segment count rose from 4 to 6 — the correction punched
+  holes in long risky stretches and split them. Fewer risky frames, more
+  risky *segments*, and the bar counts segments.
+- **`16046` over-corrects.** It is the deliberately weak case (area 0.331),
+  chosen to test exactly this. Triggering frames fell 62% while peak
+  windowed area rose 16%.
+- **`videoplayback` is untouched.** 158 → 158 triggering frames, peak area
+  1.000 → 1.000, nothing moved at all. Yet mean luminance fell 19.9% and
+  contrast 16.8%, so the model *did* alter the video — it changed the
+  picture without changing the verdict. This is the whole-frame-flagged
+  case, and it is the clearest evidence that the remaining problem is the
+  correction's quality inside the mask, not its reach.
+
+**Do not report phase 2 as "2 of 3".** It is 2 of 6. The three clips with
+Tier 0 baselines are the easier half.
+
+### Two things real data settled that synthetic data could not
+
+**The risk term is finally live.** `soft_area` starts at **0.2146** on this
+corpus against 0.0774 on synthetic init, and `risk` at 0.0705 against
+0.0063 — eleven times higher. The note further down about `--lambda-risk`
+sitting in the softplus's flat region was true *of synthetic data*: real
+footage starts just under the ITU `max_area_ratio` of 0.25, where the
+softplus has slope. `--lambda-risk` is worth tuning now; it was not before.
+
+**Global shift estimation is more reliable here, not less.**
+`trusted_fraction` is **0.9442** against 0.8842 on synthetic. The design
+spec called camera motion its largest unvalidated risk. It is not the
+problem.
+
+### What phase 2 says to do next, in order
+
+1. **Fix segment fragmentation.** `1257` is the only clip that got *worse*
+   by the bar, going 4 → 6 segments while losing a third of its triggering
+   frames. A correction that thins a long risky stretch without clearing it
+   splits one segment into several, and the bar counts segments. This is
+   the cheapest failure to understand and may be shared with Cera.
+2. **Tune `--lambda-risk`** — see above; it now has gradient to give.
+3. **Look at `videoplayback`.** Verdict completely unmoved while luminance
+   fell 19.9%: the model changed the picture and not the risk. Whatever is
+   wrong there is not reach, not motion, and not data volume.
+4. **`16046` over-corrects** (peak area +16%). Watch it as the
+   over-correction canary the spec chose it to be.
 
 ---
 
@@ -183,13 +277,34 @@ validation values — compare step lines to step lines only.
 
 Roughly in order. Items in the same group are independent of each other.
 
-**1. Decide what replaces the mask blend.** `max_area` is 1.000 on 17 of 17
-real clips, so `mitigate_frame`'s "pixels outside the mask stay original"
-guarantee protects nothing on real footage. This is the heaviest open
-question and it changes how ingestion should work, so decide it before
-building anything for phase 2.
+**1. ~~Decide what replaces the mask blend.~~ RETIRED — the premise was
+wrong.** Measured on 2026-08-08; do not re-open it without reading this.
 
-**2. Decide the frame-0 and warm-up handling.** The Detector fabricates an
+`max_area` is a per-clip maximum of a **1-second window**, not a per-frame
+mask saturation rate. Per frame, masks are effectively full on **5 of 674**
+in-segment frames for wonbon (0.7%) and **0 of 234** for Cera. In-segment
+mask area averages 0.351 and 0.554 — the blend is protecting most of the
+frame, not nothing.
+
+The follow-up hypothesis — that the blend *confines* the correction — is
+also wrong, and structurally so. `compute_prior` builds `mask_i` as an OR
+over recent raw masks, so it always contains `raw_i`: of 23.5M flagged
+pixels on wonbon and 11.2M on Cera, **zero** fell outside the given mask.
+88% (wonbon) and 95% (Cera) of the flicker that survives correction sits
+*inside* the region the model was free to edit. The problem is the quality
+of the correction there, and phase 2's `videoplayback` result says the same
+thing (whole frame flagged, verdict completely unmoved).
+
+One real defect remains: the blend's hard spatial edge *creates* flicker.
+5–12% of post-correction flagged pixels were not flagged before and lie
+outside the mask — a pixel corrected at frame i−1 and left original at
+frame i steps. Same class as the un-ramped segment boundary. Both are
+deferred; see Known-deferred items.
+
+**2. ~~Decide the frame-0 and warm-up handling.~~ DONE.** The first
+`round(fps)` frames are excluded as training centres (they stay in
+`degraded/` so `compute_prior` still sees real neighbours; trimming the
+clip would just move the warm-up). Original note kept for context: The Detector fabricates an
 all-ones mask for frame 0 and mask persistence ORs it forward ~0.2 s;
 `uncertain_frames` equals fps exactly on every clip. Real segments start at
 frame 0, so phase 2 trains on whole-frame corrections there unless
@@ -244,23 +359,42 @@ be loaded** — `in_channels` went from `9+1+16` to `9+1+1`.
 
 ---
 
-## Phase 2 is blocked on three missing pieces
+## The phase-2 tooling that now exists
 
-1. **No ingestion path.** `MitigatorDataset` wants
-   `<sample>/meta.json` (needs `fps`) plus `<sample>/degraded/000000.png…`.
-   `training/cli.py` only produces that by *injecting* flicker into clean
-   sources, and has no flag to skip injection. Phase 2 must not inject.
+All of it landed on 2026-08-08. Do not rebuild any of it.
 
-2. **No `--init-from`.** `--resume` loads `latest.pt` from the *same*
-   `--checkpoint-dir` and restores model **and optimizer and epoch
-   counter**. Copying a phase-1 checkpoint into a phase-2 directory and
-   passing `--resume` restores optimizer momentum from a different dataset
-   and sets `start_epoch = 30`, so `range(30, 30)` runs **zero epochs and
-   exits cleanly**. A weights-only initialisation flag does not exist.
+- **`scripts/ingest_real_clips.py`** — mp4 directory to sample directories,
+  no injection. Long side capped at 512 (matching `mitigator/infer.py`'s
+  `_MAX_PROCESSING_DIM`, so training and inference see one resolution).
+  `clip_id` is an ASCII slug plus a hash of the original filename, because
+  the corpus has emoji, `#`, `!`, Korean and doubled spaces.
+- **`--init-from PATH`** on the trainer — weights only, fresh optimizer,
+  epoch 0. Passing it together with `--resume` is now an error rather than
+  a silent precedence rule.
+- **`--split-file PATH`** — explicit `clip_id` → `train`/`val` map, checked
+  against the directory in *both* directions. Omitted, the `clip_id` hash
+  still decides, so the synthetic path is unchanged.
+- **`--snapshot-every N`** — keeps `epoch_NNN.pt`. Phase 1 lost its lowest
+  `soft_area` epoch because only `best.pt` and `latest.pt` survived.
+- **`--log-every N`** — running mean of every loss term every N steps.
 
-3. **Screening runs the wrong direction.** `scripts/screen_clean_clips.py`
-   keeps clips the Detector does *not* flag — valid clean sources for
-   synthesis. Phase 2 needs the inverse.
+**The "inverted screener" was deliberately not built.** All 17 real clips
+are already screened, with the results in
+`data/raw/real_flicker_screening.json` and zero passes. It is a tool for
+footage not yet collected — build it when new clips actually arrive. The
+three missing pieces were two.
+
+Corpus and split are settled: 14 clips / 8,190 frames in `data/real`
+(dropping `7301-199291564_medium` as unusable, `56426-479655491_medium` as
+a duplicate source, and `1258-144566586_medium` for stock-id adjacency to
+an eval clip), split by `configs/splits/phase2.json` into 11 train (5,865
+examples) and 3 dev (484).
+
+**512 downscaling does not change the Detector's verdict on this corpus.**
+Measured on six clips including three 1080p ones — identical segment counts
+and in-segment percentages at 512 and at native resolution. Worth knowing
+because `read_frames_lenient`'s docstring warns it can, the ITU criterion
+being an area ratio.
 
 ---
 
