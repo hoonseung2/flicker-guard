@@ -79,6 +79,64 @@ committing to a long run.
 
 ---
 
+## How to judge the run you just started
+
+Watch three numbers per epoch. The reference points are from a fresh init
+on one real validation batch:
+
+| | init | healthy after training | collapse |
+|---|---|---|---|
+| `fidelity` | 0.0217 | ~0.02, roughly flat | **→ 0.001** |
+| `temporal` | 0.0258 | falling toward ~0.010 | flat or rising |
+| `soft_area` | 0.0774 | falling toward ~0.050 | flat or rising |
+
+**`fidelity` is the signal that matters.** If it collapses toward 0.001 the
+model has chosen the trivial solution and nothing else in the log means
+anything — stop and raise λ_temporal. If it climbs past ~0.06 you are into
+over-correction; λ_t = 200 measured 0.303 and produced a correction larger
+than the frame itself.
+
+Larger batches mean fewer optimiser steps per epoch: 9259 train examples is
+1157 steps/epoch at `--batch-size 8` but only 579 at 16. A small measured
+improvement over 3 epochs is not failure — check the *direction* first, and
+add epochs before changing anything else.
+
+## What to do after phase 1
+
+Roughly in order. Items in the same group are independent of each other.
+
+**1. Decide what replaces the mask blend.** `max_area` is 1.000 on 17 of 17
+real clips, so `mitigate_frame`'s "pixels outside the mask stay original"
+guarantee protects nothing on real footage. This is the heaviest open
+question and it changes how ingestion should work, so decide it before
+building anything for phase 2.
+
+**2. Decide the frame-0 and warm-up handling.** The Detector fabricates an
+all-ones mask for frame 0 and mask persistence ORs it forward ~0.2 s;
+`uncertain_frames` equals fps exactly on every clip. Real segments start at
+frame 0, so phase 2 trains on whole-frame corrections there unless
+something changes.
+
+**3. Normalise the corpus.** Resolutions span 360×640 to 3840×2160 and the
+ITU criterion is an area ratio. Drop one of the two
+`56426-479655491*` files (same source, two resolutions, and `clip_split`
+hashes the id so they can straddle the train/val split). Check whether the
+two Travis Scott clips are the same performance. Decide whether the
+61-frame clip is usable at all.
+
+**4. Build the three missing pieces** (see the section below): the
+injection-free ingestion path, `--init-from`, and the inverted screener.
+
+**5. Define what phase-2 success means.** Synthetic data had a reference;
+real footage does not. The tools are Detector re-validation plus the
+within-frame contrast now reported by `scripts/evaluate_mitigation.py` —
+but no target numbers have been agreed. Tier 0's cost is the bar to beat:
+see `docs/` and the Tier 0 notes for its measured contrast loss.
+
+**6. Consider implementing spec §7's periodic detector evaluation.** In
+phase 1 you can live without it. In phase 2 it is the only window into
+whether training is actually reducing risk.
+
 ## Data
 
 **Synthesis is ITU-only.** `configs/profiles/` ships six profiles;
