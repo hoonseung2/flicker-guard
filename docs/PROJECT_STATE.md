@@ -101,23 +101,42 @@ the 674 in-segment frames:
 | G | 0.1084 | 0.0825 | **0.761** |
 | B | 0.1084 | 0.1084 | **1.000** |
 
-**Red and blue are untouched to four decimals; only green moves.** Drop
-green and the picture goes magenta. Outside the segments all three channels
-sit at 0.98, so this is the correction, not the codec.
+Outside the segments all three channels sit at 0.98, so this is the
+correction, not the codec.
 
-This is not an implementation bug. Every term in the loss is computed on
-`relative_luminance`, which is `0.2126·R + 0.7152·G + 0.0722·B`
-(`detector/luminance.py:14`). To move luminance by a given amount you can
-change green by `1/0.7152` or blue by `1/0.0722` — **13.9× more**. And
-`fidelity` penalises raw RGB change. So the cheapest way to satisfy the
-objective is to spend the entire correction on the highest-leverage
-channel, and that is exactly what the model learned.
+**Those means mislead, and the per-pixel figures are the real story.** Over
+120 corrected frames, mean per-pixel `|delta|` is R 0.0390, G 0.1412,
+B 0.0144, and roughly 72% of pixels move in *every* channel — red and blue
+change plenty, their means just cancel. What matters is the ratio,
+**G : R : B = 10.1 : 2.8 : 1**, against the luminance coefficients
+`0.7152 : 0.2126 : 0.0722` = **9.9 : 2.9 : 1**.
 
-**Nothing in the loss asks it to preserve colour.** The fix is a
-channel-ratio term — permit the darkening that was deliberately accepted,
-forbid the hue shift. This is the same failure mode as the removed
-histogram path recorded in `mitigator/arch.py`: the objective was
-satisfiable in a way nobody intended, and the model complied.
+The correction is distributed across channels in proportion to each
+channel's luminance weight. That is not a quirk — it is the exact minimum-
+norm solution to "change luminance by this much, with the least RGB
+change", which is what the objective asks for. Every loss term is computed
+on `relative_luminance` (`detector/luminance.py:14`) and `fidelity`
+penalises raw RGB change, so the model is solving the stated problem
+correctly.
+
+The hue shifts because a *fixed-direction* subtraction is not a *scaling*.
+Reducing a pixel proportionally to its own (R, G, B) preserves its colour;
+subtracting a constant-direction vector does not.
+
+**Nothing in the loss asks it to preserve colour.** Same failure mode as
+the removed histogram path recorded in `mitigator/arch.py`: the objective
+was satisfiable in a way nobody intended, and the model complied.
+
+**The fix probably does not need retraining.** `mitigate_frame` applies the
+model's output additively (`restored = center + delta`). Taking only the
+luminance change it implies and applying that as a per-pixel *scale* —
+`restored = center * lum(center + delta) / lum(center)` — preserves the
+RGB ratio by construction rather than by penalty. Since `temporal`, `risk`
+and `soft_area` are all luminance-based, the same luminance should give
+close to the same Detector verdict. Needs a guard for `lum(center) == 0`
+and must be verified by re-evaluation, since the model was trained under
+the additive form. A channel-ratio loss term is the fallback if this fails,
+at roughly three times the cost.
 
 It also revises the deferral of the boundary-taper work below. That
 deferral was argued on brightness steps alone, measured against each
@@ -141,9 +160,8 @@ problem.
 
 ### What phase 2 says to do next, in order
 
-1. **Add a colour-preservation term.** See above — the model spends its
-   entire correction on green because luminance weights it 0.7152. This is
-   the most visible defect in the output and the cheapest to state.
+1. **Fix the hue shift.** Try the multiplicative output form first — it
+   needs no retraining and preserves colour by construction. See above.
 2. **Fix segment fragmentation.** `1257` is the only clip that got *worse*
    by the bar, going 4 → 6 segments while losing a third of its triggering
    frames. A correction that thins a long risky stretch without clearing it
