@@ -83,7 +83,8 @@ _Updated as the night proceeds._
 - Ingestion: complete — 14 clips, 8,190 frames.
 - Split file: `configs/splits/phase2.json`, train 11 / dev 3.
 - Smoke run (1 epoch): passed, exit 0.
-- Run 1 (from scratch, 30 epochs): launched.
+- Run 1 (from scratch, 30 epochs): complete, best epoch 28. **2 of 3 pass.**
+- Run 2 (--init-from phase-1 best.pt): running.
 
 ## What the smoke run showed
 
@@ -112,3 +113,42 @@ phase 1's 0/3, measured rather than inferred.
 
 After one epoch: `soft_area` 0.2146 → 0.0927 (val), `temporal` 0.0667 →
 0.0276, `risk` 0.0705 → 0.0182.
+
+
+---
+
+## Run 1 result: from scratch, 30 epochs, best epoch 28
+
+`val_loss` 0.3186 -> 0.2674. Epochs ran 110 s each; the whole run took
+about 55 minutes.
+
+Re-validated on the three clips the Tier 0 baseline was measured on:
+
+| clip | Tier 0 | phase 1 best | phase 2 scratch |
+|---|---|---|---|
+| wonbon | 5 -> 0 | 5 -> 2 | **5 -> 0** |
+| Anyma | 1 -> 0 | 1 -> 0 | **1 -> 0** |
+| Cera Khin | 1 -> 0 | 1 -> 1 | 1 -> 1 |
+
+**2 of 3, against phase 1's best of 1 of 3.** In-segment contrast against
+each clip's own Tier 0 figure:
+
+| clip | phase 2 | Tier 0 | |
+|---|---|---|---|
+| wonbon | **-48.3%** | -52.8% | cheaper |
+| Anyma | -30.5% | **-6.0%** | 5x more expensive |
+| Cera | -54.1% | -48.4% | more expensive, and still fails |
+
+**wonbon is the first result in this project to clear both halves of the
+spec's bar at once** — zero remaining risk segments *and* a smaller
+contrast cost than the classical fallback. Its peak windowed area fell
+62.9% and every one of its 574 triggering frames is gone.
+
+Anyma passes the segment bar and loses the cost one. This is where the
+mislabelled baseline would have mattered: -30.5% read against -52.8% looks
+like a comfortable win, and against Anyma's real -6.0% it is a five-fold
+loss.
+
+Cera is stuck exactly where phase 1 left it — peak windowed area +0.5%,
+essentially unmoved, with its segment running from frame 279 to the end of
+the clip. Whatever Cera needs, training on real footage did not supply it.
