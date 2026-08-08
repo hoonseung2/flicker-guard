@@ -8,3 +8,14 @@ data/
 # Trained Mitigator checkpoints — large, regenerable binary artifacts.
 mitigator/weights/*
 !mitigator/weights/.gitkeep
+
+# Training logs are not artifacts, they are the measurements. Every
+# per-epoch figure quoted in docs/PROJECT_STATE.md comes from these, and
+# they are a few kilobytes each -- without them a later session cannot
+# check why an epoch was chosen, or what the run's oscillation looked like,
+# without spending hours retraining to find out.
+!mitigator/weights/*/
+mitigator/weights/*/*
+!mitigator/weights/*/train_log.jsonl
+!mitigator/weights/*.log
+!mitigator/weights/*/*.log
