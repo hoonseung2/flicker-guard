@@ -40,6 +40,27 @@ def save_checkpoint(
     )
 
 
+def load_model_weights(path: Path, model: MitigatorNet) -> None:
+    """Load only the weights -- no optimizer state, no epoch counter.
+
+    Deliberately distinct from load_checkpoint. --resume restores the epoch
+    counter too, so pointing it at a finished run's checkpoint makes
+    range(start_epoch, epochs) empty: the process trains nothing and exits
+    successfully, which is indistinguishable from a fast run unless you
+    check the log. Starting phase 2 from a phase-1 checkpoint needs the
+    weights and nothing else.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    try:
+        model.load_state_dict(checkpoint["model"])
+    except RuntimeError as exc:
+        raise ValueError(
+            f"{path} does not fit the current MitigatorNet. Check in_channels: it went "
+            f"from 9+1+16 to 9+1+1 when the histogram embedding was removed, and "
+            f"checkpoints written before that cannot be loaded. Original error: {exc}"
+        ) from exc
+
+
 def load_checkpoint(path: Path, model: MitigatorNet, optimizer: torch.optim.Optimizer) -> tuple[int, float]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict(checkpoint["model"])
@@ -337,6 +358,21 @@ def main(argv: list[str] | None = None) -> int:
              "already-compliant frames too.",
     )
     parser.add_argument("--log-path")
+    parser.add_argument("--split-file", default=None,
+                        help="JSON mapping clip_id -> 'train' | 'val'. Omit to use the clip_id "
+                             "hash, which is what the synthetic corpus uses. Phase 2 needs this: "
+                             "its dev set has to span the difficulty range, and 14 clips cannot "
+                             "be hashed into a split that does.")
+    parser.add_argument("--init-from", default=None,
+                        help="Initialise the model from a checkpoint's weights only -- fresh "
+                             "optimizer, epoch counter back to 0. Use this to start phase 2 from "
+                             "a phase-1 checkpoint. Mutually exclusive with --resume.")
+    parser.add_argument("--snapshot-every", type=int, default=0,
+                        help="Also keep <checkpoint-dir>/epoch_NNN.pt every N epochs (0 = off). "
+                             "best.pt tracks val_loss, which was measured over 30 epochs not to "
+                             "track the Detector verdict -- snapshots are what let a different "
+                             "epoch be evaluated after the run rather than being lost. Phase 1 "
+                             "lost its lowest-soft_area epoch exactly this way.")
     parser.add_argument("--patch-size", type=int, default=None,
                         help="Optional: random crop to this spatial size (e.g. 256) for VRAM-limited training on local GPUs. "
                              "Omit for full-resolution training on high-VRAM hardware (default: None, no crop).")
@@ -354,8 +390,20 @@ def main(argv: list[str] | None = None) -> int:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_path = Path(args.log_path) if args.log_path else checkpoint_dir / "train_log.jsonl"
 
-    train_dataset = MitigatorDataset(Path(args.data_dir), profile, split="train")
-    val_dataset = MitigatorDataset(Path(args.data_dir), profile, split="val")
+    if args.init_from and args.resume:
+        raise ValueError(
+            "--init-from and --resume are mutually exclusive: --init-from starts a new run "
+            "from borrowed weights, --resume continues an existing one."
+        )
+
+    split_map = None
+    if args.split_file:
+        split_map = json.loads(Path(args.split_file).read_text(encoding="utf-8"))
+
+    train_dataset = MitigatorDataset(Path(args.data_dir), profile, split="train",
+                                     split_map=split_map)
+    val_dataset = MitigatorDataset(Path(args.data_dir), profile, split="val",
+                                   split_map=split_map)
     print(
         f"train split: {len(train_dataset)} examples from "
         f"{train_dataset.samples_contributing}/{train_dataset.samples_scanned} contributing samples"
@@ -419,6 +467,10 @@ def main(argv: list[str] | None = None) -> int:
     start_epoch = 0
     best_val_loss = float("inf")
     latest_path = checkpoint_dir / "latest.pt"
+    if args.init_from:
+        load_model_weights(Path(args.init_from), model)
+        print(f"initialised weights from {args.init_from} "
+              f"(fresh optimizer, starting at epoch 0)", flush=True)
     if args.resume and latest_path.exists():
         resumed_epoch, best_val_loss = load_checkpoint(latest_path, model, optimizer)
         start_epoch = resumed_epoch + 1
@@ -450,6 +502,14 @@ def main(argv: list[str] | None = None) -> int:
         save_checkpoint(latest_path, model, optimizer, epoch, best_val_loss)
         if is_new_best:
             save_checkpoint(checkpoint_dir / "best.pt", model, optimizer, epoch, best_val_loss)
+
+        # The final epoch is always snapshotted, whatever the interval, so
+        # the end state of a run is never the one epoch that got dropped.
+        if args.snapshot_every > 0 and (
+            (epoch - start_epoch) % args.snapshot_every == 0 or epoch == args.epochs - 1
+        ):
+            save_checkpoint(checkpoint_dir / f"epoch_{epoch:03d}.pt", model, optimizer,
+                            epoch, best_val_loss)
 
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps({

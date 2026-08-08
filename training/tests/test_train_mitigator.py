@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 from pathlib import Path
 
 import pytest
@@ -278,7 +279,7 @@ def test_main_val_loader_handles_differently_shaped_examples(tmp_path, monkeypat
     # must hardcode val batch_size=1 to sidestep this.
     import training.train_mitigator as train_mitigator_module
 
-    def _fake_dataset(data_dir, profile, split):
+    def _fake_dataset(data_dir, profile, split, **kwargs):
         if split == "train":
             return _FakeMitigatorDataset()
         return _VariableShapeMitigatorDataset()
@@ -802,3 +803,107 @@ def test_soft_area_and_trusted_fraction_are_zero_when_nothing_is_trusted():
     terms = compute_batch_losses(batch, model, "cpu", profile)
     assert terms["soft_area"].item() == pytest.approx(0.0, abs=1e-6)
     assert terms["trusted_fraction"].item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_init_from_loads_weights_without_optimizer_or_epoch(tmp_path):
+    from training.train_mitigator import load_model_weights
+
+    torch.manual_seed(0)
+    source = MitigatorNet()
+    optimizer = torch.optim.AdamW(source.parameters(), lr=1e-2)
+    dataloader = torch.utils.data.DataLoader(_FixedBatchDataset(), batch_size=4)
+    train_one_epoch(source, optimizer, dataloader, device="cpu", profile=_PROFILE)
+    path = tmp_path / "phase1.pt"
+    save_checkpoint(path, source, optimizer, epoch=29, best_val_loss=0.17)
+
+    target = MitigatorNet()
+    load_model_weights(path, target)
+
+    for a, b in zip(source.parameters(), target.parameters()):
+        assert torch.equal(a, b)
+
+
+def test_init_from_reports_an_architecture_mismatch_clearly(tmp_path):
+    # in_channels went from 9+1+16 to 9+1+1 once already, and load_state_dict's
+    # raw error names a tensor shape rather than the cause.
+    from training.train_mitigator import load_model_weights
+
+    path = tmp_path / "wrong.pt"
+    torch.save({"model": {"nope": torch.zeros(1)}, "epoch": 0}, path)
+
+    with pytest.raises(ValueError, match="in_channels"):
+        load_model_weights(path, MitigatorNet())
+
+
+def test_init_from_and_resume_together_is_an_error(tmp_path, monkeypatch):
+    # --resume restores the epoch counter, so aiming it at a finished run
+    # makes range(start_epoch, epochs) empty: zero epochs, exit code 0.
+    import training.train_mitigator as train_module
+
+    monkeypatch.setattr(train_module, "MitigatorDataset", _FakeMitigatorDataset)
+    path = tmp_path / "phase1.pt"
+    model = MitigatorNet()
+    save_checkpoint(path, model, torch.optim.AdamW(model.parameters(), lr=1e-3), epoch=0)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        train_module.main([
+            "--data-dir", str(tmp_path), "--profile", "configs/profiles/itu.json",
+            "--checkpoint-dir", str(tmp_path / "ckpt"), "--epochs", "1",
+            "--init-from", str(path), "--resume",
+        ])
+
+
+def test_split_file_is_passed_through_to_both_datasets(tmp_path, monkeypatch):
+    import training.train_mitigator as train_module
+
+    seen = []
+
+    class _Recorder(_FakeMitigatorDataset):
+        def __init__(self, *args, **kwargs):
+            seen.append(kwargs.get("split_map"))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(train_module, "MitigatorDataset", _Recorder)
+    split_file = tmp_path / "split.json"
+    split_file.write_text(json.dumps({"a": "train", "b": "val"}), encoding="utf-8")
+
+    train_module.main([
+        "--data-dir", str(tmp_path), "--profile", "configs/profiles/itu.json",
+        "--checkpoint-dir", str(tmp_path / "ckpt"), "--epochs", "1",
+        "--split-file", str(split_file),
+    ])
+
+    assert seen == [{"a": "train", "b": "val"}, {"a": "train", "b": "val"}]
+
+
+def test_snapshot_every_keeps_intermediate_epochs(tmp_path, monkeypatch):
+    # Phase 1 kept only best.pt and latest.pt, so its lowest-soft_area epoch
+    # (22 of 30) could not be evaluated afterwards at all.
+    import training.train_mitigator as train_module
+
+    monkeypatch.setattr(train_module, "MitigatorDataset", _FakeMitigatorDataset)
+    checkpoint_dir = tmp_path / "ckpt"
+
+    train_module.main([
+        "--data-dir", str(tmp_path), "--profile", "configs/profiles/itu.json",
+        "--checkpoint-dir", str(checkpoint_dir), "--epochs", "5",
+        "--snapshot-every", "2",
+    ])
+
+    assert sorted(p.name for p in checkpoint_dir.glob("epoch_*.pt")) == [
+        "epoch_000.pt", "epoch_002.pt", "epoch_004.pt"
+    ]
+
+
+def test_snapshots_are_off_by_default(tmp_path, monkeypatch):
+    import training.train_mitigator as train_module
+
+    monkeypatch.setattr(train_module, "MitigatorDataset", _FakeMitigatorDataset)
+    checkpoint_dir = tmp_path / "ckpt"
+
+    train_module.main([
+        "--data-dir", str(tmp_path), "--profile", "configs/profiles/itu.json",
+        "--checkpoint-dir", str(checkpoint_dir), "--epochs", "2",
+    ])
+
+    assert list(checkpoint_dir.glob("epoch_*.pt")) == []
