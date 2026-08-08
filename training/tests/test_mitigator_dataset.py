@@ -150,19 +150,34 @@ def test_dataset_tracks_samples_scanned_and_contributing(tmp_path):
         assert dataset.samples_contributing == contributing
 
 
-def test_dataset_includes_every_frame_of_a_segment_regardless_of_warm_up(tmp_path):
-    # Segment membership alone gates inclusion now (the retired
-    # histogram-validity gate excluded a segment's early frames until
-    # Detector's trailing window stopped reporting uncertain=True). A
-    # segment starting at frame 0 exercises exactly that boundary: frame 0
-    # must be included even though it is within Detector's warm-up window,
-    # since it is still inside the risk segment.
+def test_dataset_excludes_the_detector_warm_up_from_a_segment(tmp_path):
+    # This used to assert the opposite -- that segment membership alone
+    # gates inclusion, so a segment starting at frame 0 contributed frame 0.
+    # That reasoning was about the retired histogram-validity gate and was
+    # right on synthetic data, where the injected segment is the truth.
+    #
+    # It is wrong on real footage. Frame 0 has no predecessor, so the
+    # Detector cannot compute a transition and conservatively masks the
+    # entire frame; mask persistence then ORs that forward. uncertain_frames
+    # equals fps exactly on all 17 screened real clips, and real segments
+    # frequently start at frame 0 -- so those frames would teach the model
+    # to correct whole frames from a mask that means "unknown", not
+    # "flashing".
     _write_fake_sample(tmp_path, "clipF", n_frames=20, fps=10.0,
                        segments=[{"start_frame": 0, "end_frame": 15}])
     split = clip_split("clipF")
     dataset = MitigatorDataset(tmp_path, PROFILE, split=split)
     frame_indices = sorted(idx for _, idx in dataset._index)
-    assert frame_indices == list(range(16))  # every frame of the segment, 0-15 inclusive
+    assert frame_indices == [10, 11, 12, 13, 14, 15]  # round(10.0) frames dropped
+
+
+def test_dataset_keeps_a_segment_that_starts_after_the_warm_up_intact(tmp_path):
+    # The exclusion is a floor on the frame index, not a blanket trim: a
+    # segment wholly past the warm-up must be untouched.
+    _write_fake_sample(tmp_path, "clipG", n_frames=20, fps=10.0,
+                       segments=[{"start_frame": 12, "end_frame": 15}])
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=clip_split("clipG"))
+    assert sorted(idx for _, idx in dataset._index) == [12, 13, 14, 15]
 
 
 def test_prior_cache_is_written_and_reused(tmp_path, monkeypatch):
@@ -383,3 +398,104 @@ def test_a_stale_prior_cache_is_rejected_rather_than_misread(tmp_path):
     )
     with pytest.raises(ValueError, match="prior cache"):
         _load_prior_cache(stale)
+
+
+def _write_real_sample(root, clip_id, n_frames=20, h=8, w=8, fps=10.0):
+    """A sample in the shape scripts.ingest_real_clips produces: no 'segments'
+    key and no clean/ directory, because a real clip has neither."""
+    sample_dir = root / clip_id
+    frames = [np.full((h, w, 3), 0.5, dtype=np.float32) for _ in range(n_frames)]
+    _write_frames(frames, sample_dir / "degraded")
+    meta = {"clip_id": clip_id, "source": f"{clip_id}.mp4", "fps": fps,
+            "frames": n_frames, "shape": [h, w]}
+    (sample_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return sample_dir
+
+
+def _fake_priors(n_frames, risky, h=8, w=8):
+    from prior.compute import FramePrior
+    return [
+        FramePrior(frame_index=i, mask=np.ones((h, w), dtype=bool),
+                   required_strength=0.5 if i in risky else 0.0)
+        for i in range(n_frames)
+    ]
+
+
+def test_dataset_derives_risky_frames_from_priors_when_meta_has_no_segments(tmp_path, monkeypatch):
+    # Ingested real clips carry no "segments": producing them would rerun the
+    # detection compute_prior already runs, and _assign_segment_strengths
+    # sets required_strength above 0 on exactly a RiskSegment's frames.
+    import training.mitigator_dataset as dataset_module
+
+    _write_real_sample(tmp_path, "realclip", n_frames=20, fps=1.0)
+    monkeypatch.setattr(dataset_module, "_load_or_compute_prior",
+                        lambda *a, **k: _fake_priors(20, risky={12, 13, 14}))
+
+    dataset = MitigatorDataset(tmp_path, PROFILE, split="train",
+                               split_map={"realclip": "train"})
+
+    assert sorted(idx for _, idx in dataset._index) == [12, 13, 14]
+
+
+def test_warm_up_exclusion_applies_to_prior_derived_risky_frames_too(tmp_path, monkeypatch):
+    import training.mitigator_dataset as dataset_module
+
+    _write_real_sample(tmp_path, "realclip", n_frames=20, fps=5.0)
+    monkeypatch.setattr(dataset_module, "_load_or_compute_prior",
+                        lambda *a, **k: _fake_priors(20, risky=set(range(20))))
+
+    dataset = MitigatorDataset(tmp_path, PROFILE, split="train",
+                               split_map={"realclip": "train"})
+
+    assert sorted(idx for _, idx in dataset._index) == list(range(5, 20))
+
+
+def test_split_map_overrides_the_hash(tmp_path, monkeypatch):
+    import training.mitigator_dataset as dataset_module
+
+    for clip_id in ("alpha", "beta"):
+        _write_real_sample(tmp_path, clip_id, n_frames=20, fps=1.0)
+    monkeypatch.setattr(dataset_module, "_load_or_compute_prior",
+                        lambda *a, **k: _fake_priors(20, risky={12, 13}))
+    split_map = {"alpha": "train", "beta": "val"}
+
+    train = MitigatorDataset(tmp_path, PROFILE, split="train", split_map=split_map)
+    val = MitigatorDataset(tmp_path, PROFILE, split="val", split_map=split_map)
+
+    assert train.samples_scanned == 1
+    assert val.samples_scanned == 1
+
+
+def test_split_map_errors_when_a_clip_on_disk_is_absent_from_it(tmp_path, monkeypatch):
+    # The hash split needed no file kept in sync; an explicit map does. A
+    # clip missing from the map lands in neither split and is never trained
+    # on, which looks like a smaller corpus rather than an error.
+    import training.mitigator_dataset as dataset_module
+
+    _write_real_sample(tmp_path, "alpha", n_frames=20, fps=1.0)
+    monkeypatch.setattr(dataset_module, "_load_or_compute_prior",
+                        lambda *a, **k: _fake_priors(20, risky={12}))
+
+    with pytest.raises(ValueError, match="missing from the split map"):
+        MitigatorDataset(tmp_path, PROFILE, split="train", split_map={"beta": "train"})
+
+
+def test_split_map_errors_when_it_names_a_clip_that_is_not_on_disk(tmp_path, monkeypatch):
+    import training.mitigator_dataset as dataset_module
+
+    _write_real_sample(tmp_path, "alpha", n_frames=20, fps=1.0)
+    monkeypatch.setattr(dataset_module, "_load_or_compute_prior",
+                        lambda *a, **k: _fake_priors(20, risky={12}))
+
+    with pytest.raises(ValueError, match="not found on disk"):
+        MitigatorDataset(tmp_path, PROFILE, split="train",
+                         split_map={"alpha": "train", "ghost": "val"})
+
+
+def test_split_map_is_optional_so_the_synthetic_path_is_unchanged(tmp_path):
+    # Phase 1 has to stay reproducible: with no map the clip_id hash decides,
+    # exactly as before.
+    _write_fake_sample(tmp_path, "clipH", n_frames=20, fps=10.0,
+                       segments=[{"start_frame": 12, "end_frame": 15}])
+    dataset = MitigatorDataset(tmp_path, PROFILE, split=clip_split("clipH"))
+    assert dataset.samples_scanned == 1

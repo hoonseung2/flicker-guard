@@ -112,10 +112,18 @@ def _load_or_compute_prior(
 
 
 class MitigatorDataset(Dataset):
-    def __init__(self, data_dir: Path, profile: ThresholdProfile, split: str):
+    def __init__(self, data_dir: Path, profile: ThresholdProfile, split: str,
+                 split_map: dict[str, str] | None = None):
         if split not in ("train", "val"):
             raise ValueError(f"split must be 'train' or 'val', got {split!r}")
         self.data_dir = Path(data_dir)
+        # None keeps the clip_id hash described in the module docstring,
+        # which is right for the 188 synthetic samples. It is not right for
+        # phase 2's 14 real clips: the dev set has to span the difficulty
+        # range (the criterion the design spec used to pick the six
+        # evaluation clips), and a hash cannot be asked for that. The cost
+        # is a file that must stay in sync, which the check below pays.
+        self._split_map = split_map
         # Only the FramePrior objects __getitem__ actually reads (the risky
         # center frames that landed in self._index) are retained here --
         # each FramePrior carries a full-resolution per-pixel mask,
@@ -139,12 +147,35 @@ class MitigatorDataset(Dataset):
         self.samples_scanned = 0
         self.samples_contributing = 0
 
+        if split_map is not None:
+            on_disk = {
+                json.loads((d / "meta.json").read_text(encoding="utf-8"))["clip_id"]
+                for d in sorted(self.data_dir.iterdir())
+                if (d / "meta.json").exists()
+            }
+            # Checked both ways. A clip on disk but absent from the map would
+            # be dropped from both splits and never trained on; a clip in the
+            # map but absent from disk means the corpus is not the one the
+            # map describes. Either way the run would look normal.
+            missing = sorted(on_disk - set(split_map))
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} clip(s) under {self.data_dir} are missing from the "
+                    f"split map: {missing}. They would be silently dropped from both splits."
+                )
+            absent = sorted(set(split_map) - on_disk)
+            if absent:
+                raise ValueError(
+                    f"{len(absent)} clip(s) in the split map were not found on disk: "
+                    f"{absent}. The corpus is not what the map describes."
+                )
+
         for sample_dir in sorted(self.data_dir.iterdir()):
             meta_path = sample_dir / "meta.json"
             if not meta_path.exists():
                 continue
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            if clip_split(meta["clip_id"]) != split:
+            if self._split_of(meta["clip_id"]) != split:
                 continue
 
             self.samples_scanned += 1
@@ -161,9 +192,30 @@ class MitigatorDataset(Dataset):
             priors = _load_or_compute_prior(sample_dir, fps, profile)
             self._frame_counts[sample_dir] = len(priors)
 
+            # Synthetic samples record the injected segments in meta.json.
+            # Ingested real clips do not, and deriving them there would rerun
+            # the detection compute_prior has already done. required_strength
+            # carries the same fact: prior/compute.py:_assign_segment_strengths
+            # sets it above 0.0 on exactly the frames of a detected
+            # RiskSegment, and that is also the gate mitigate_segment uses to
+            # decide whether a frame needs correcting.
             risky_indices: set[int] = set()
-            for segment in meta["segments"]:
-                risky_indices.update(range(segment["start_frame"], segment["end_frame"] + 1))
+            if "segments" in meta:
+                for segment in meta["segments"]:
+                    risky_indices.update(range(segment["start_frame"], segment["end_frame"] + 1))
+            else:
+                risky_indices = {p.frame_index for p in priors if p.required_strength > 0.0}
+
+            # The Detector cannot judge the first second: frame 0 has no
+            # predecessor, so it conservatively masks the whole frame, and
+            # mask persistence ORs that forward. uncertain_frames equals fps
+            # exactly on all 17 screened clips. Real segments often start at
+            # frame 0, so without this the model learns whole-frame
+            # corrections there. The frames stay in degraded/ -- trimming the
+            # clip instead would just give the trimmed clip its own warm-up
+            # one second later, and compute_prior needs real neighbours.
+            warmup_frames = round(fps)
+            risky_indices = {i for i in risky_indices if i >= warmup_frames}
 
             sample_priors: dict[int, FramePrior] = {}
             for prior in priors:
@@ -174,6 +226,11 @@ class MitigatorDataset(Dataset):
             if sample_priors:
                 self._priors_by_sample[sample_dir] = sample_priors
                 self.samples_contributing += 1
+
+    def _split_of(self, clip_id: str) -> str:
+        if self._split_map is None:
+            return clip_split(clip_id)
+        return self._split_map[clip_id]
 
     def __len__(self) -> int:
         return len(self._index)
