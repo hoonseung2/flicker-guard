@@ -129,17 +129,35 @@ def train_one_epoch(
     lambda_risk: float = 1.0,
     tau: float = 0.02,
     tau_area: float = 0.05,
+    log_every: int = 0,
 ) -> float:
     model.train()
     total_loss = 0.0
     n_batches = 0
+    total_batches = len(dataloader)
+    # Progress reporting is per-N-steps rather than per-epoch because an
+    # epoch is long enough (13 min at bs=16 patch 256 on a 4090 laptop, 90+
+    # min on a 4 GB card) that a 30-epoch run gives no signal for hours.
+    # The terms are reported separately for the same reason evaluate() does
+    # it: fidelity rising while temporal falls is the over-correction
+    # signature, and the combined loss hides which way that trade is going.
+    #
+    # The window sums stay on-device and are only read at print time.
+    # loss.item() below already forces one host sync per step for the NaN
+    # check, so accumulating these as tensors costs nothing extra --
+    # calling .item() on each term every step would add four more syncs.
+    window_keys = ("loss", "fidelity", "temporal", "risk", "soft_area")
+    window_sums: dict | None = None
+    window_n = 0
+    epoch_start = time.time()
     for batch in dataloader:
         optimizer.zero_grad()
-        loss = compute_batch_losses(
+        terms = compute_batch_losses(
             batch, model, device, profile,
             lambda_temporal=lambda_temporal, lambda_risk=lambda_risk,
             tau=tau, tau_area=tau_area,
-        )["loss"]
+        )
+        loss = terms["loss"]
         loss_value = loss.item()
         if loss_value != loss_value:  # NaN check (NaN != NaN) -- fail loud, never train through it
             raise RuntimeError(
@@ -153,6 +171,33 @@ def train_one_epoch(
 
         total_loss += loss_value
         n_batches += 1
+
+        if log_every > 0:
+            if window_sums is None:
+                window_sums = {k: terms[k].detach().clone() for k in window_keys}
+            else:
+                for k in window_keys:
+                    window_sums[k] += terms[k].detach()
+            window_n += 1
+            # The final partial window is flushed too, so the last line of an
+            # epoch always covers every step rather than silently dropping
+            # the remainder when total_batches is not a multiple of log_every.
+            if n_batches % log_every == 0 or n_batches == total_batches:
+                means = {k: (window_sums[k] / window_n).item() for k in window_keys}
+                rate = n_batches / max(time.time() - epoch_start, 1e-9)
+                print(
+                    f"  step {n_batches}/{total_batches} "
+                    f"loss={means['loss']:.4f} fidelity={means['fidelity']:.4f} "
+                    f"temporal={means['temporal']:.4f} risk={means['risk']:.4f} "
+                    f"soft_area={means['soft_area']:.4f} "
+                    f"({rate:.2f} it/s, train eta {(total_batches - n_batches) / rate / 60:.1f} min)",
+                    flush=True,
+                )
+                # Reset so each line is the mean over the last window rather
+                # than a cumulative average, which flattens out late in an
+                # epoch and would mask a term that starts diverging.
+                window_sums = None
+                window_n = 0
     return total_loss / n_batches
 
 
@@ -295,6 +340,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--patch-size", type=int, default=None,
                         help="Optional: random crop to this spatial size (e.g. 256) for VRAM-limited training on local GPUs. "
                              "Omit for full-resolution training on high-VRAM hardware (default: None, no crop).")
+    parser.add_argument("--log-every", type=int, default=0,
+                        help="Print a running mean of every loss term every N training steps. "
+                             "0 (default) prints only the per-epoch line, which on a long run "
+                             "means no signal between epoch boundaries -- set it for multi-hour "
+                             "runs so a diverging fidelity term is visible before the epoch ends. "
+                             "Each line is the mean over the last N steps, not a cumulative average.")
     args = parser.parse_args(argv)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -378,6 +429,7 @@ def main(argv: list[str] | None = None) -> int:
             model, optimizer, train_loader, device, profile,
             lambda_temporal=args.lambda_temporal, lambda_risk=args.lambda_risk,
             tau=args.tau, tau_area=args.tau_area,
+            log_every=args.log_every,
         )
         val_metrics = evaluate(
             model, val_loader, device, profile,

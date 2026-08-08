@@ -1,3 +1,5 @@
+import contextlib
+import io
 from pathlib import Path
 
 import pytest
@@ -638,6 +640,48 @@ def test_evaluate_reports_every_loss_term():
     metrics = evaluate(model, loader, device="cpu", profile=profile)
     for key in ("loss", "fidelity", "temporal", "risk", "soft_area", "trusted_fraction"):
         assert key in metrics
+
+
+def test_train_one_epoch_is_silent_between_epochs_by_default():
+    # The per-step line is opt-in: the epoch line is the record, and a
+    # default-on step line would flood any existing log consumer.
+    from training.train_mitigator import train_one_epoch
+
+    model = MitigatorNet()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    loader = torch.utils.data.DataLoader(_SelfSupervisedBatchDataset(), batch_size=2)
+    profile = load_profile(Path("configs/profiles/itu.json"))
+
+    with contextlib.redirect_stdout(io.StringIO()) as captured:
+        train_one_epoch(model, optimizer, loader, device="cpu", profile=profile)
+
+    assert captured.getvalue() == ""
+
+
+def test_train_one_epoch_log_every_reports_each_term_and_flushes_the_last_window():
+    # An epoch is 13+ minutes, so a 30-epoch run has no signal for hours
+    # without this. Every term is reported separately for the same reason
+    # the epoch line does it -- fidelity rising while temporal falls is the
+    # over-correction signature, and the combined loss hides it.
+    from training.train_mitigator import train_one_epoch
+
+    model = MitigatorNet()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    # 5 batches against log_every=2 leaves a partial final window: without
+    # the n_batches == total_batches flush, step 5 would never be reported
+    # and the epoch would appear to end at step 4.
+    loader = torch.utils.data.DataLoader(_SelfSupervisedBatchDataset(n=5), batch_size=1)
+    profile = load_profile(Path("configs/profiles/itu.json"))
+
+    with contextlib.redirect_stdout(io.StringIO()) as captured:
+        train_one_epoch(model, optimizer, loader, device="cpu", profile=profile, log_every=2)
+
+    lines = [line for line in captured.getvalue().splitlines() if line.strip()]
+    assert len(lines) == 3  # steps 2, 4, and the partial 5
+    assert "step 5/5" in lines[-1]
+    for line in lines:
+        for term in ("loss=", "fidelity=", "temporal=", "risk=", "soft_area="):
+            assert term in line
 
 
 def test_an_untrusted_shift_drops_the_temporal_and_risk_terms():
