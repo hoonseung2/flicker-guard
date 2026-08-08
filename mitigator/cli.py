@@ -53,12 +53,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--profile", required=True)
-    parser.add_argument("--preserve-hue", action="store_true",
-                        help="Apply only the luminance change the model asks for, as a scale on "
-                             "linear RGB, instead of adding its residual directly. The additive "
-                             "form moves each channel in proportion to its luminance weight "
-                             "(0.7152 for green against 0.0722 for blue), which visibly shifts "
-                             "hue; scaling leaves chromaticity untouched by construction.")
+    parser.add_argument("--no-preserve-hue", action="store_false", dest="preserve_hue",
+                        help="Add the model's residual directly instead of applying only the "
+                             "luminance it implies. The additive form moves each channel in "
+                             "proportion to its luminance weight (0.7152 for green against "
+                             "0.0722 for blue) and visibly shifts hue; it is kept only to "
+                             "reproduce results measured before 2026-08-09.")
     args = parser.parse_args(argv)
 
     frame_iter, fps = read_video_frames(args.input)

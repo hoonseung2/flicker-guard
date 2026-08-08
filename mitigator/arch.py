@@ -188,7 +188,7 @@ def mitigate_frame(
     mask: torch.Tensor,
     strength: torch.Tensor,
     model: MitigatorNet,
-    preserve_hue: bool = False,
+    preserve_hue: bool = True,
 ) -> torch.Tensor:
     delta = model(window, mask, strength)
     center = window[:, 3:6, :, :]

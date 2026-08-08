@@ -151,9 +151,37 @@ is fractionally *lower*, still under Tier 0's −52.8%. This works because
 every term that decides the verdict reads luminance only, so preserving
 chromaticity costs the objective nothing.
 
-Off by default so far, and the additive path is byte-for-byte unchanged —
-only wonbon has been checked. Verify on the other five evaluation clips
-before making it the default.
+**Now the default.** `--no-preserve-hue` restores the additive form, kept
+only to reproduce measurements taken before 2026-08-09.
+
+Checked on all six evaluation clips, and it is *not* free everywhere — but
+the pass set is identical:
+
+| clip | additive | preserve-hue |
+|---|---|---|
+| wonbon | 5 → 0 | 5 → 0 |
+| Anyma | 1 → 0 | 1 → 0 |
+| Cera | 1 → 1, trip 157 | 1 → 1, trip 213 |
+| `1257` | 4 → 6, trip 580 | 4 → 7, trip 695 |
+| `16046` | 1 → 1, trip 27 | 1 → 1, trip 72 |
+| `videoplayback` | 1 → 1, trip 158 | 1 → 1, trip 158 |
+
+Both forms pass the same two clips and fail the same four. Where they
+differ, they differ on clips that fail either way.
+
+**On `16046` that difference is threshold noise, not skill.** The two
+outputs have *identical* flagged-area distributions — median 0.1077, max
+0.3857 for both — and 61 of the clip's 71 over-limit frames sit in the
+0.20–0.30 band around the ITU limit of 0.25. A mean per-pixel luminance
+difference of 0.0004 decides which side ~45 frames land on. The additive
+form's apparent 62% reduction there was a coin flip, not a win, and the
+same caution applies to reading any single-clip result on a knife-edge
+corpus.
+
+`1257` going 4 → 7 segments rather than 4 → 6 is the one difference not
+shown to be threshold noise. Fragmentation is already that clip's own
+failure mode (see the phase-2 section), so it is worth re-checking when
+that gets attention.
 
 It also revises the deferral of the boundary-taper work below. That
 deferral was argued on brightness steps alone, measured against each
@@ -177,9 +205,8 @@ problem.
 
 ### What phase 2 says to do next, in order
 
-1. **~~Fix the hue shift.~~ DONE** on wonbon — `--preserve-hue`, no
-   retraining, verdict unchanged. Re-check it on the other five clips and
-   then make it the default.
+1. **~~Fix the hue shift.~~ DONE and now the default** — no retraining, and
+   the pass set is unchanged across all six clips. See above.
 2. **Fix segment fragmentation.** `1257` is the only clip that got *worse*
    by the bar, going 4 → 6 segments while losing a third of its triggering
    frames. A correction that thins a long risky stretch without clearing it

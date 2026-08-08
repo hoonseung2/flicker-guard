@@ -30,7 +30,7 @@ def mitigate_segment(
     fps: float,
     profile: ThresholdProfile,
     model: MitigatorNet,
-    preserve_hue: bool = False,
+    preserve_hue: bool = True,
 ) -> list[np.ndarray]:
     # compute_prior (detector scoring + motion compensation) has no internal
     # progress hooks and runs single-threaded on CPU regardless of the

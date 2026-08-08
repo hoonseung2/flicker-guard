@@ -170,7 +170,9 @@ def test_apply_luminance_of_falls_back_to_the_additive_result_on_black():
     assert torch.equal(apply_luminance_of(center, target), target)
 
 
-def test_mitigate_frame_leaves_the_additive_path_untouched_by_default():
+def test_mitigate_frame_preserves_hue_by_default():
+    # Default since 2026-08-09. The additive form stays reachable only to
+    # reproduce measurements taken before that.
     from mitigator.arch import MitigatorNet, mitigate_frame
 
     torch.manual_seed(2)
@@ -181,8 +183,8 @@ def test_mitigate_frame_leaves_the_additive_path_untouched_by_default():
 
     with torch.no_grad():
         default = mitigate_frame(window, mask, strength, model)
-        explicit = mitigate_frame(window, mask, strength, model, preserve_hue=False)
         hue = mitigate_frame(window, mask, strength, model, preserve_hue=True)
+        additive = mitigate_frame(window, mask, strength, model, preserve_hue=False)
 
-    assert torch.equal(default, explicit)
-    assert not torch.allclose(default, hue)
+    assert torch.equal(default, hue)
+    assert not torch.allclose(default, additive)
