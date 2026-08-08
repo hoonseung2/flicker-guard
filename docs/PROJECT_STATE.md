@@ -127,16 +127,33 @@ subtracting a constant-direction vector does not.
 the removed histogram path recorded in `mitigator/arch.py`: the objective
 was satisfiable in a way nobody intended, and the model complied.
 
-**The fix probably does not need retraining.** `mitigate_frame` applies the
-model's output additively (`restored = center + delta`). Taking only the
-luminance change it implies and applying that as a per-pixel *scale* —
-`restored = center * lum(center + delta) / lum(center)` — preserves the
-RGB ratio by construction rather than by penalty. Since `temporal`, `risk`
-and `soft_area` are all luminance-based, the same luminance should give
-close to the same Detector verdict. Needs a guard for `lum(center) == 0`
-and must be verified by re-evaluation, since the model was trained under
-the additive form. A channel-ratio loss term is the fallback if this fails,
-at roughly three times the cost.
+**FIXED, without retraining — `mitigate_frame(..., preserve_hue=True)`,
+`--preserve-hue` on `mitigator.cli`.** Instead of adding the residual, take
+only the luminance it implies and apply that as a scale on *linear* RGB.
+Scaling linear RGB by a scalar leaves chromaticity unchanged by
+construction, so the hue shift becomes impossible rather than penalised.
+(Linear light matters: multiplying encoded sRGB would shift colour again
+through the gamma curve. Pixels below a luminance floor have no
+chromaticity and fall back to the additive result.)
+
+Measured on wonbon, 27.5M lit pixels over 120 corrected frames:
+
+| | additive | `--preserve-hue` |
+|---|---|---|
+| mean chromaticity shift | 0.23748 | **0.02035** (−91.4%) |
+| risk segments | 5 → 0 | 5 → **0** |
+| triggering frames | 574 → 0 | 574 → **0** |
+| peak windowed area | −64.5% | −64.2% |
+| in-segment contrast | −48.6% | **−48.3%** |
+
+**The colour comes free.** The verdict is unchanged and the contrast cost
+is fractionally *lower*, still under Tier 0's −52.8%. This works because
+every term that decides the verdict reads luminance only, so preserving
+chromaticity costs the objective nothing.
+
+Off by default so far, and the additive path is byte-for-byte unchanged —
+only wonbon has been checked. Verify on the other five evaluation clips
+before making it the default.
 
 It also revises the deferral of the boundary-taper work below. That
 deferral was argued on brightness steps alone, measured against each
@@ -160,8 +177,9 @@ problem.
 
 ### What phase 2 says to do next, in order
 
-1. **Fix the hue shift.** Try the multiplicative output form first — it
-   needs no retraining and preserves colour by construction. See above.
+1. **~~Fix the hue shift.~~ DONE** on wonbon — `--preserve-hue`, no
+   retraining, verdict unchanged. Re-check it on the other five clips and
+   then make it the default.
 2. **Fix segment fragmentation.** `1257` is the only clip that got *worse*
    by the bar, going 4 → 6 segments while losing a third of its triggering
    frames. A correction that thins a long risky stretch without clearing it
