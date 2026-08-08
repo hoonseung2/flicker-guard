@@ -20,8 +20,58 @@ criterion.
 Also on `master`: the **Tier 0 fallback**, the project's first output to
 pass Detector re-validation (3/3 real clips).
 
-Phase 1 training has been **started and diagnosed, not completed**. Read the
-next section before launching anything.
+Phase 1 training is **finished**. It answered the question it was built to
+answer, and the answer is not the one the rest of this file was written
+expecting — read the next section before planning anything.
+
+---
+
+## Phase 1 is done, and it did not clear the bar
+
+30 epochs at `--lambda-temporal 10 --batch-size 16 --patch-size 256`, 5.7
+hours, no divergence and no collapse. `best.pt` is epoch 27.
+
+| | init | best (e27) | target below |
+|---|---|---|---|
+| `soft_area` | 0.0774 | **0.0370** (−52%) | ~0.050 — beaten |
+| `temporal` | 0.0258 | **0.0105** (−59%) | ~0.010 — reached |
+| `fidelity` | 0.0217 | 0.0623 | ~0.02 — not held |
+| `val_loss` | 0.2324 (e0) | 0.1683 | — |
+
+**The loss design works. It does not transfer.** Both flicker terms beat
+their targets on synthetic validation. The checkpoint was then run over the
+three real clips the Tier 0 baseline was measured on:
+
+| clip | Tier 0 | after 3 epochs | after 30 epochs |
+|---|---|---|---|
+| wonbon | 5 → **0** | 5 → 2 | 5 → **4** |
+| Anyma | 1 → **0** | 1 → **0** | 1 → **1** |
+| Cera Khin | 1 → **0** | 1 → 1 | 1 → **1** |
+
+**More training made the real-clip verdict worse: 1/3 → 0/3.** Anyma passed
+at 3 epochs (30 triggering frames → 0) and fails at 30 (30 → 30). wonbon's
+peak windowed area went from −51.2% at 3 epochs to **+7.0%** at 30.
+
+In-segment contrast cost fell everywhere over the same stretch — wonbon
+−48.9% → −41.0%, Anyma −28.8% → −23.9%, Cera −53.6% → −50.4%. Both
+movements are one fact: **the model got gentler.** `fidelity` agrees
+(0.0695 at e2, 0.0623 at e27).
+
+So **`val_loss` does not track the goal.** It improved 28% across the run
+while the criterion the project is graded on went backwards. Do not select
+a checkpoint, or decide to stop, on it alone.
+
+The likely cause is the synthetic-to-real gap rather than the objective.
+Synthetic `soft_area` starts at 0.0774 — a world where 8% of the frame is
+flagged. These three clips peak at 0.630 / 0.401 / 0.658, and all 17 clips
+in `data/raw/real_flicker/` peak at **1.000**. The model spent 30 epochs
+specialising to a regime real footage is not in. λ tuning does not fix
+that. Phase 2 does, and this is the measurement showing it is not optional.
+
+The 3-epoch checkpoint — the better of the two on the real bar — is kept at
+`mitigator/weights/phase1/epoch2_evaluated.pt`. Note also that the trainer
+only ever writes `best.pt` and `latest.pt`, so the epoch with the lowest
+`soft_area` (e22, 0.0328) was not saved and cannot be evaluated.
 
 ---
 
@@ -96,10 +146,38 @@ anything — stop and raise λ_temporal. If it climbs past ~0.06 you are into
 over-correction; λ_t = 200 measured 0.303 and produced a correction larger
 than the frame itself.
 
+**The ~0.06 line is softer than it reads.** The completed 30-epoch run sat
+at 0.060–0.073 for almost its whole length and was *under*-correcting on
+real footage, not over-correcting — the clips it failed, it failed by
+leaving flicker in. Treat 0.06 as "watch this", and 0.30 as the number that
+actually meant a ruined picture. Judge over-correction on the contrast
+figure from `scripts/evaluate_mitigation.py`, not on `fidelity` alone.
+
+**None of these three numbers predicts the Detector verdict.** All three
+moved the right way across 30 epochs while the real-clip result went from
+1/3 to 0/3. They tell you the run is healthy; they do not tell you it is
+working. Only re-validation on real clips does that, so run it — at 3
+epochs as well as at the end, because the two disagreed here.
+
 Larger batches mean fewer optimiser steps per epoch: 9259 train examples is
 1157 steps/epoch at `--batch-size 8` but only 579 at 16. A small measured
 improvement over 3 epochs is not failure — check the *direction* first, and
 add epochs before changing anything else.
+
+**Expect the epoch numbers to oscillate.** Over 30 epochs `val_loss` swung
+±0.02 on a roughly 3-epoch period on top of a real downward trend, and two
+consecutive worse epochs twice looked like the onset of collapse and twice
+were not. `fidelity` and the flicker terms move *against* each other epoch
+to epoch (e17: 0.0550 / temporal 0.0129; e18: 0.0715 / 0.0108), so a flat
+`val_loss` can hide both still moving. Do not act on fewer than three
+consecutive epochs in the same direction.
+
+Use `--log-every N` to print a running mean of every term every N steps;
+without it an epoch is 11+ minutes of silence. It reports the mean over the
+last N steps, not a cumulative average, so a term that starts to diverge is
+visible rather than averaged away. Those step figures come from 256×256
+crops and are **not** comparable to the epoch line's full-resolution
+validation values — compare step lines to step lines only.
 
 ## What to do after phase 1
 
@@ -244,6 +322,29 @@ is a fraction of the *frame*; `soft_area` computed on a 256×256 crop is a
 fraction of the crop. Unmeasured, but worth suspecting if phase 1 results
 look strange.
 
+That suspicion did **not** pay off for the completed run. Validation is
+deliberately never cropped (`collate_fn=None` on the val loader), so the
+`soft_area` in the epoch log is already a frame-level figure — and it
+improved while the real-clip verdict got worse. Whatever caused that, it is
+not the crop-versus-frame mismatch. The caveat still stands for the
+training term.
+
+### Second machine: RTX 4090 Laptop, 16 GB, 20 cores
+
+The numbers above are all from the 4 GB card. On a 4090 laptop the shape
+changes enough to re-plan around:
+
+- **11–12 min per epoch** at `--batch-size 16 --patch-size 256`. 30 epochs
+  is **5.7 hours**, not 45.
+- `bs=16` peaks at ~5.7 GB and does not hit the 4 GB card's 13.9 s/step
+  cliff — that cliff was spillover to system memory, not a real limit.
+- `--num-workers 8` (of 20 cores) keeps GPU utilisation at 80–100%.
+- The GPU sat at 70–75 °C throughout, power-capped rather than
+  thermally capped (`clocks_throttle_reasons.active` = `0x4`, SW power cap;
+  neither thermal bit ever set).
+
+Check which machine you are on before trusting either table.
+
 ---
 
 ## Known-deferred items
@@ -259,8 +360,35 @@ look strange.
 - `README.md:132` and `mitigator/infer.py:7` still name PSNR/SSIM-vs-GT,
   which spec §7 calls unusable for this task.
 - Spec §7's "full detector evaluation after training and every 5 epochs"
-  was never implemented. Do not assume it is present.
+  was never implemented. Do not assume it is present. The 30-epoch run is
+  the argument for implementing it: the epoch log looked healthy the whole
+  way while the real verdict decayed, and nothing in the loop would have
+  told you.
 - Dated 2026-08-03 design docs still describe the removed histogram path.
+- **The Tier 0 contrast baseline is misattributed in two docs.** −52.8% is
+  **wonbon**, not Anyma; Anyma's is **−6.0%** and Cera Khin's −48.4%. The
+  per-clip table in
+  `docs/superpowers/specs/2026-08-07-tier0-fallback-measurements.md` is the
+  correct source — the +1.87% mean-luminance figure quoted alongside −52.8%
+  comes from wonbon's row, which is what pins it. Fixed in
+  `scripts/evaluate_mitigation.py`; still wrong in spec §7 and in
+  `docs/superpowers/plans/2026-08-07-self-supervised-pipeline.md`. This
+  matters: believing Anyma's bar is −52.8% turns a 4.8×-worse result into
+  an apparent win.
+- **Segment boundaries step, and nothing ramps them.**
+  `_assign_segment_strengths` is a step function — full strength inside a
+  segment, exactly 0 outside. On the 3-epoch output the worst boundary jump
+  was 0.0780 (wonbon), 5–29× the original's jump at the same frame and in
+  the 93rd–99.7th percentile of the corrected clip. Deliberately not fixed:
+  every one of those steps is still *below* its clip's original p95
+  frame-to-frame delta, none trips the Detector, and the magnitude scales
+  with however much the final model darkens — so it is worth re-measuring
+  only once something clears the bar. The segments already carry ±0.5 s of
+  margin, but that margin is the 1-second criterion window's reach, not
+  spare room, so tapering into it trades protection for smoothness. If it
+  is taken up: taper the output blend, not `required_strength` — the blend
+  is monotone by construction, survives the all-ones mask, and does not
+  contradict `_assign_segment_strengths`' stated design.
 
 ---
 
