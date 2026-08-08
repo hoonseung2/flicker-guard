@@ -84,7 +84,8 @@ _Updated as the night proceeds._
 - Split file: `configs/splits/phase2.json`, train 11 / dev 3.
 - Smoke run (1 epoch): passed, exit 0.
 - Run 1 (from scratch, 30 epochs): complete, best epoch 28. **2 of 3 pass.**
-- Run 2 (--init-from phase-1 best.pt): running.
+- Run 2 (--init-from phase-1 best.pt): complete, best epoch 16. **2 of 3 pass, and wins the tiebreak.**
+- Holdout evaluation with the winner: running.
 
 ## What the smoke run showed
 
@@ -152,3 +153,52 @@ loss.
 Cera is stuck exactly where phase 1 left it — peak windowed area +0.5%,
 essentially unmoved, with its segment running from frame 279 to the end of
 the clip. Whatever Cera needs, training on real footage did not supply it.
+
+
+---
+
+## Run 2 result: --init-from phase-1 best.pt
+
+Same settings, same dev set, same `--snapshot-every`. Best epoch **16**,
+against run 1's 28 — it converges in roughly half the epochs.
+
+| | scratch | init-from |
+|---|---|---|
+| best epoch | 28 | **16** |
+| `val_loss` | 0.2674 | **0.2538** |
+| `soft_area` | 0.0489 | **0.0452** |
+| `temporal` | 0.0194 | **0.0180** |
+| `risk` | 0.0050 | **0.0048** |
+
+Detector verdict, both runs re-validated on the same three clips:
+
+| clip | scratch | init-from |
+|---|---|---|
+| wonbon | 5 -> 0 | 5 -> 0 |
+| Anyma | 1 -> 0 | 1 -> 0 |
+| Cera | 1 -> 1 | 1 -> 1 |
+| **triggering frames, total** | **213** | **157** |
+
+Both reach 2 of 3, so the spec's primary metric ties at one remaining
+segment and the tiebreak decides: total triggering frames, 157 against
+213. On Cera specifically, init-from removes 28.3% of triggering frames
+(219 -> 157) where scratch removes 2.7% (219 -> 213), and moves peak
+windowed area -6.7% where scratch moves it +0.5%. **The only run that
+shifted the clip both failed on is the pretrained one.**
+
+In-segment contrast: init-from is cheaper on two of three (Anyma -29.9%
+vs -30.5%, Cera -53.6% vs -54.1%; wonbon -48.6% vs -48.3%).
+
+### What this settles about phase 1
+
+Yesterday's measurement was that *more synthetic training makes real-clip
+results worse* — 3 epochs beat 30 on the same held-out clips. Today's is
+that *starting phase 2 from those synthetic weights beats starting from
+scratch*. These are not in tension; they answer different questions.
+Synthetic pretraining is a bad thing to keep doing and a good thing to
+have done. Running both experiments rather than reasoning from the first
+result is what separated them, and phase 1's 5.7 hours were not wasted.
+
+`--init-from` earned its place here: with `--resume` this comparison would
+have been impossible to run, since it would have restored the epoch
+counter and trained nothing.
