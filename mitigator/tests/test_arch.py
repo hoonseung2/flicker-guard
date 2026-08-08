@@ -121,3 +121,68 @@ def test_strength_is_isolated_per_batch_item():
 
     assert torch.allclose(batched[:1], solo_0, atol=1e-5)
     assert torch.allclose(batched[1:], solo_1, atol=1e-5)
+
+
+def test_apply_luminance_of_preserves_chromaticity_exactly():
+    # The whole point: the output pixel is the input pixel scaled toward
+    # black, so its colour is untouched no matter how far luminance moves.
+    #
+    # Checked in LINEAR light, which is where chromaticity is defined.
+    # Encoded sRGB ratios are deliberately not preserved -- a scale followed
+    # by re-encoding cannot preserve both, and it is the linear ratio that
+    # determines the colour a viewer sees.
+    from mitigator.arch import apply_luminance_of, _srgb_to_linear_torch
+
+    torch.manual_seed(0)
+    center = torch.rand(2, 3, 8, 8) * 0.8 + 0.1
+    target = (center * 0.4).clamp(0, 1)  # much darker, same colour
+
+    out = apply_luminance_of(center, target)
+
+    lin_in = _srgb_to_linear_torch(center)
+    lin_out = _srgb_to_linear_torch(out)
+    ratio_in = lin_in / lin_in.sum(dim=1, keepdim=True)
+    ratio_out = lin_out / lin_out.sum(dim=1, keepdim=True)
+    assert torch.allclose(ratio_in, ratio_out, atol=1e-4)
+
+
+def test_apply_luminance_of_matches_the_requested_luminance():
+    from mitigator.arch import apply_luminance_of, _luminance_of, _srgb_to_linear_torch
+
+    torch.manual_seed(1)
+    center = torch.rand(1, 3, 8, 8) * 0.8 + 0.15
+    target = (center * 0.5).clamp(0, 1)
+
+    out = apply_luminance_of(center, target)
+
+    lum = lambda x: _luminance_of(_srgb_to_linear_torch(x))
+    assert torch.allclose(lum(out), lum(target), atol=1e-4)
+
+
+def test_apply_luminance_of_falls_back_to_the_additive_result_on_black():
+    # A black pixel has no chromaticity to preserve and the luminance ratio
+    # would divide by nearly zero, amplifying noise into colour.
+    from mitigator.arch import apply_luminance_of
+
+    center = torch.zeros(1, 3, 4, 4)
+    target = torch.full((1, 3, 4, 4), 0.3)
+
+    assert torch.equal(apply_luminance_of(center, target), target)
+
+
+def test_mitigate_frame_leaves_the_additive_path_untouched_by_default():
+    from mitigator.arch import MitigatorNet, mitigate_frame
+
+    torch.manual_seed(2)
+    model = MitigatorNet()
+    window = torch.rand(1, 9, 16, 16)
+    mask = torch.ones(1, 1, 16, 16)
+    strength = torch.rand(1, 1)
+
+    with torch.no_grad():
+        default = mitigate_frame(window, mask, strength, model)
+        explicit = mitigate_frame(window, mask, strength, model, preserve_hue=False)
+        hue = mitigate_frame(window, mask, strength, model, preserve_hue=True)
+
+    assert torch.equal(default, explicit)
+    assert not torch.allclose(default, hue)

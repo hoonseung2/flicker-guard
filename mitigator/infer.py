@@ -30,6 +30,7 @@ def mitigate_segment(
     fps: float,
     profile: ThresholdProfile,
     model: MitigatorNet,
+    preserve_hue: bool = False,
 ) -> list[np.ndarray]:
     # compute_prior (detector scoring + motion compensation) has no internal
     # progress hooks and runs single-threaded on CPU regardless of the
@@ -107,7 +108,8 @@ def mitigate_segment(
                 mask = torch.from_numpy(mask_proc[None, None, :, :]).to(device)
                 strength = torch.tensor([[prior.required_strength]], device=device)
 
-                restored = mitigate_frame(window, mask, strength, model)
+                restored = mitigate_frame(window, mask, strength, model,
+                                          preserve_hue=preserve_hue)
                 if not torch.isfinite(restored).all():
                     continue  # NaN/Inf from the model -- keep the original frame, never propagate garbage
                 restored_frame = restored.squeeze(0).permute(1, 2, 0).cpu().numpy()

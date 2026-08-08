@@ -121,13 +121,78 @@ class MitigatorNet(nn.Module):
         return self.out_conv(x)
 
 
+# Kept in step with detector.luminance, which is the authority. Transcribed
+# rather than imported because detector/ is deliberately torch-free, and
+# imported from neither training/ nor mitigator_losses because inference
+# must not depend on the training package.
+_SRGB_A = 0.055
+_SRGB_ENCODED_CUTOFF = 0.04045
+_SRGB_LINEAR_CUTOFF = 0.0031308
+_R_COEFF, _G_COEFF, _B_COEFF = 0.2126, 0.7152, 0.0722
+# Below this linear luminance a pixel is black enough to have no meaningful
+# chromaticity, and target/current would divide by nearly nothing.
+_LUM_FLOOR = 1e-4
+
+
+def _srgb_to_linear_torch(x: torch.Tensor) -> torch.Tensor:
+    safe = x.clamp(min=0.0)
+    return torch.where(safe <= _SRGB_ENCODED_CUTOFF, safe / 12.92,
+                       ((safe + _SRGB_A) / (1 + _SRGB_A)) ** 2.4)
+
+
+def _linear_to_srgb_torch(x: torch.Tensor) -> torch.Tensor:
+    safe = x.clamp(min=0.0)
+    return torch.where(safe <= _SRGB_LINEAR_CUTOFF, safe * 12.92,
+                       (1 + _SRGB_A) * safe ** (1 / 2.4) - _SRGB_A)
+
+
+def _luminance_of(linear_rgb: torch.Tensor) -> torch.Tensor:
+    return (_R_COEFF * linear_rgb[:, 0:1]
+            + _G_COEFF * linear_rgb[:, 1:2]
+            + _B_COEFF * linear_rgb[:, 2:3])
+
+
+def apply_luminance_of(center: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Give `center` the luminance of `target` without moving its colour.
+
+    The model predicts an additive residual, and every loss term scores it
+    through `relative_luminance`, whose weights are 0.2126 / 0.7152 / 0.0722.
+    The minimum-norm way to hit a luminance target is therefore to move each
+    channel in proportion to its weight -- which is what the model learned,
+    and which visibly shifts hue, because subtracting a fixed-direction
+    vector is not the same as scaling a pixel toward black. Measured on
+    wonbon: per-pixel |delta| ran G:R:B = 10.1:2.8:1 against luminance
+    coefficients of 9.9:2.9:1, and the output went magenta.
+
+    Scaling linear RGB by a scalar leaves chromaticity exactly unchanged, so
+    taking only the luminance the model asked for and applying it this way
+    makes the hue shift impossible rather than merely penalised -- and needs
+    no retraining, since the terms that decide the Detector verdict read
+    luminance only.
+
+    The scaling has to happen in linear light. Multiplying encoded sRGB
+    values would shift colour again through the gamma curve.
+    """
+    linear_c = _srgb_to_linear_torch(center)
+    lum_c = _luminance_of(linear_c)
+    lum_t = _luminance_of(_srgb_to_linear_torch(target))
+
+    scaled = _linear_to_srgb_torch(linear_c * (lum_t / lum_c.clamp(min=_LUM_FLOOR)))
+    # A near-black pixel has no colour to preserve and an unstable ratio;
+    # fall back to the additive result there rather than amplifying noise.
+    return torch.where(lum_c > _LUM_FLOOR, scaled, target)
+
+
 def mitigate_frame(
     window: torch.Tensor,
     mask: torch.Tensor,
     strength: torch.Tensor,
     model: MitigatorNet,
+    preserve_hue: bool = False,
 ) -> torch.Tensor:
     delta = model(window, mask, strength)
     center = window[:, 3:6, :, :]
     restored = center + delta
+    if preserve_hue:
+        restored = apply_luminance_of(center, restored)
     return mask * restored + (1 - mask) * center

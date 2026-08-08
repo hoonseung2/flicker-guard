@@ -96,7 +96,7 @@ def test_mitigate_segment_passes_through_frame_on_nan_output(monkeypatch):
     ]
     monkeypatch.setattr(infer_module, "compute_prior", lambda frames, fps, profile: fake_priors)
 
-    def _nan_mitigate_frame(window, mask, strength, model):
+    def _nan_mitigate_frame(window, mask, strength, model, **kwargs):
         return torch.full((1, 3, window.shape[-2], window.shape[-1]), float("nan"))
 
     monkeypatch.setattr(infer_module, "mitigate_frame", _nan_mitigate_frame)

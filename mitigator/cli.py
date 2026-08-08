@@ -53,6 +53,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--profile", required=True)
+    parser.add_argument("--preserve-hue", action="store_true",
+                        help="Apply only the luminance change the model asks for, as a scale on "
+                             "linear RGB, instead of adding its residual directly. The additive "
+                             "form moves each channel in proportion to its luminance weight "
+                             "(0.7152 for green against 0.0722 for blue), which visibly shifts "
+                             "hue; scaling leaves chromaticity untouched by construction.")
     args = parser.parse_args(argv)
 
     frame_iter, fps = read_video_frames(args.input)
@@ -60,7 +66,8 @@ def main(argv: list[str] | None = None) -> int:
     profile = load_profile(Path(args.profile))
     model = load_model(Path(args.checkpoint))
 
-    corrected = mitigate_segment(frames, fps=fps, profile=profile, model=model)
+    corrected = mitigate_segment(frames, fps=fps, profile=profile, model=model,
+                                 preserve_hue=args.preserve_hue)
     write_video(corrected, Path(args.output), fps)
 
     print(f"processed {len(frames)} frames -> {args.output}")
