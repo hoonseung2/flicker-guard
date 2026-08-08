@@ -222,7 +222,15 @@ def _print_report(before: dict, after: dict, lum_before: dict, lum_after: dict, 
         (report_contrast_after - report_contrast_before) / report_contrast_before * 100
         if report_contrast_before else 0.0
     )
-    print("  Tier 0 baseline on real clips: -52.8% (Anyma), -48.4% (Cera Khin), measured in-segment.")
+    # All three are listed because the bar is per-clip, and Anyma's is an
+    # order of magnitude tighter than the other two. -52.8% was previously
+    # printed here attributed to Anyma; it is wonbon's. See the per-clip
+    # table in docs/superpowers/specs/2026-08-07-tier0-fallback-measurements.md
+    # -- the +1.87% mean-luminance figure quoted in contrast_stats' docstring
+    # comes from the same row, which is what pins -52.8% to wonbon. Anyma is
+    # mild only because Tier 0 touched 4.3% of its frames; a correction
+    # confined to the mask has to beat -6.0% there, not -52.8%.
+    print("  Tier 0 baseline, measured in-segment: -52.8% (wonbon), -48.4% (Cera Khin), -6.0% (Anyma).")
     print(f"  This run: {contrast_change_pct:+.1f}% mean contrast"
           f"{' (in-segment)' if contrast_affected is not None else ' (whole-clip; no segment to isolate)'}.")
     print("  A neural correction that passes but costs more contrast than this loses to a")
