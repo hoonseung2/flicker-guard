@@ -90,6 +90,41 @@ Three distinct failures, not one:
 **Do not report phase 2 as "2 of 3".** It is 2 of 6. The three clips with
 Tier 0 baselines are the easier half.
 
+### The output is visibly purple, and the objective is why
+
+Watched for the first time on 2026-08-09. Measured on wonbon, means over
+the 674 in-segment frames:
+
+| channel | original | mitigated | ratio |
+|---|---|---|---|
+| R | 0.1084 | 0.1084 | **1.000** |
+| G | 0.1084 | 0.0825 | **0.761** |
+| B | 0.1084 | 0.1084 | **1.000** |
+
+**Red and blue are untouched to four decimals; only green moves.** Drop
+green and the picture goes magenta. Outside the segments all three channels
+sit at 0.98, so this is the correction, not the codec.
+
+This is not an implementation bug. Every term in the loss is computed on
+`relative_luminance`, which is `0.2126·R + 0.7152·G + 0.0722·B`
+(`detector/luminance.py:14`). To move luminance by a given amount you can
+change green by `1/0.7152` or blue by `1/0.0722` — **13.9× more**. And
+`fidelity` penalises raw RGB change. So the cheapest way to satisfy the
+objective is to spend the entire correction on the highest-leverage
+channel, and that is exactly what the model learned.
+
+**Nothing in the loss asks it to preserve colour.** The fix is a
+channel-ratio term — permit the darkening that was deliberately accepted,
+forbid the hue shift. This is the same failure mode as the removed
+histogram path recorded in `mitigator/arch.py`: the objective was
+satisfiable in a way nobody intended, and the model complied.
+
+It also revises the deferral of the boundary-taper work below. That
+deferral was argued on brightness steps alone, measured against each
+clip's own p95 frame-to-frame luminance change. A 24% green step at a
+segment edge is a colour discontinuity, which is not in that comparison at
+all and is far more visible.
+
 ### Two things real data settled that synthetic data could not
 
 **The risk term is finally live.** `soft_area` starts at **0.2146** on this
@@ -106,16 +141,19 @@ problem.
 
 ### What phase 2 says to do next, in order
 
-1. **Fix segment fragmentation.** `1257` is the only clip that got *worse*
+1. **Add a colour-preservation term.** See above — the model spends its
+   entire correction on green because luminance weights it 0.7152. This is
+   the most visible defect in the output and the cheapest to state.
+2. **Fix segment fragmentation.** `1257` is the only clip that got *worse*
    by the bar, going 4 → 6 segments while losing a third of its triggering
    frames. A correction that thins a long risky stretch without clearing it
    splits one segment into several, and the bar counts segments. This is
    the cheapest failure to understand and may be shared with Cera.
-2. **Tune `--lambda-risk`** — see above; it now has gradient to give.
-3. **Look at `videoplayback`.** Verdict completely unmoved while luminance
+3. **Tune `--lambda-risk`** — see above; it now has gradient to give.
+4. **Look at `videoplayback`.** Verdict completely unmoved while luminance
    fell 19.9%: the model changed the picture and not the risk. Whatever is
    wrong there is not reach, not motion, and not data volume.
-4. **`16046` over-corrects** (peak area +16%). Watch it as the
+5. **`16046` over-corrects** (peak area +16%). Watch it as the
    over-correction canary the spec chose it to be.
 
 ---
